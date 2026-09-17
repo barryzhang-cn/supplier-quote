@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../server/app';
 import { testDb } from './setup';
-import { insertUser, loginToken, auth } from './helpers';
+import { insertUser, inviteSupplierToAllTenders, loginToken, auth } from './helpers';
 import { tenders, quotes, users } from '../server/db/schema';
 
 async function setup() {
@@ -15,6 +15,8 @@ async function setup() {
     .insert(tenders)
     .values({ title: 'T1', deadline: new Date(Date.now() + 86400_000), createdBy: boss.id })
     .returning();
+await inviteSupplierToAllTenders(testDb, boss.id);
+  await inviteSupplierToAllTenders(testDb, boss.id);
   return { app, bossId: boss.id, t1 };
 }
 

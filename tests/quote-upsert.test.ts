@@ -3,7 +3,7 @@ import request from 'supertest';
 import { eq } from 'drizzle-orm';
 import { createApp } from '../server/app';
 import { testDb } from './setup';
-import { insertUser, loginToken, auth } from './helpers';
+import { insertUser, inviteSupplierToAllTenders, loginToken, auth } from './helpers';
 import { tenders, quotes, users } from '../server/db/schema';
 
 async function setup() {
@@ -18,6 +18,7 @@ async function setup() {
     .insert(tenders)
     .values({ title: '开放', deadline: new Date(Date.now() + 86400_000), createdBy: boss.id })
     .returning();
+  await inviteSupplierToAllTenders(testDb, sup.user.id);
   const [closed] = await testDb
     .insert(tenders)
     .values({
@@ -27,16 +28,19 @@ async function setup() {
       createdBy: boss.id,
     })
     .returning();
+await inviteSupplierToAllTenders(testDb, sup.user.id);
   const [past] = await testDb
     .insert(tenders)
     .values({ title: '已过期', deadline: new Date(Date.now() - 1000), createdBy: boss.id })
     .returning();
+await inviteSupplierToAllTenders(testDb, sup.user.id);
+  await inviteSupplierToAllTenders(testDb, sup.user.id);
   return { app, bossId: boss.id, supId: sup.user.id, token, open, closed, past };
 }
 
 describe('报价 upsert 与截止锁定', () => {
   it('首次提交成功，金额两位小数', async () => {
-    const { app, open, token } = await setup();
+    const { app, open, supId, token } = await setup();
     const res = await request(app)
       .put(`/api/tenders/${open.id}/quote`)
       .set(auth(token))
@@ -46,7 +50,7 @@ describe('报价 upsert 与截止锁定', () => {
   });
 
   it('非法金额返回 422（负数、三位小数、非数字）', async () => {
-    const { app, open, token } = await setup();
+    const { app, open, supId, token } = await setup();
     for (const amount of ['-1', '1.234', 'abc', '']) {
       const res = await request(app)
         .put(`/api/tenders/${open.id}/quote`)
@@ -74,7 +78,7 @@ describe('报价 upsert 与截止锁定', () => {
   });
 
   it('已关闭的招标返回 409', async () => {
-    const { app, closed, token } = await setup();
+    const { app, closed, supId, token } = await setup();
     const res = await request(app)
       .put(`/api/tenders/${closed.id}/quote`)
       .set(auth(token))
@@ -83,7 +87,7 @@ describe('报价 upsert 与截止锁定', () => {
   });
 
   it('已过截止时间的招标返回 409（以服务器时间为准）', async () => {
-    const { app, past, token } = await setup();
+    const { app, past, supId, token } = await setup();
     const res = await request(app)
       .put(`/api/tenders/${past.id}/quote`)
       .set(auth(token))

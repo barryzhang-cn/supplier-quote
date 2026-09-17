@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../server/app';
 import { testDb } from './setup';
-import { insertUser, loginToken, auth } from './helpers';
+import { insertUser, inviteSupplierToAllTenders, loginToken, auth } from './helpers';
 import { tenders, quotes, users } from '../server/db/schema';
 
 async function setup() {
@@ -24,10 +24,12 @@ describe('供应商-招标列表与详情', () => {
       .insert(tenders)
       .values({ title: '开放招标', deadline: new Date(Date.now() + 86400_000), createdBy: bossId })
       .returning();
+await inviteSupplierToAllTenders(testDb, supId);
     const [past] = await testDb
       .insert(tenders)
       .values({ title: '已截止', deadline: new Date(Date.now() - 1000), createdBy: bossId })
       .returning();
+await inviteSupplierToAllTenders(testDb, supId);
     const t0 = new Date('2026-09-17T08:00:00Z');
     await testDb.insert(quotes).values([
       {
@@ -68,6 +70,7 @@ describe('供应商-招标列表与详情', () => {
       .insert(tenders)
       .values({ title: 'T1', deadline: new Date(Date.now() + 86400_000), createdBy: bossId })
       .returning();
+await inviteSupplierToAllTenders(testDb, supId);
     const t0 = new Date('2026-09-17T08:00:00Z');
     await testDb.insert(quotes).values([
       {
@@ -95,11 +98,12 @@ describe('供应商-招标列表与详情', () => {
   });
 
   it('未报价时 myQuote 为 null', async () => {
-    const { app, bossId, token } = await setup();
+    const { app, bossId, supId, token } = await setup();
     const [t1] = await testDb
       .insert(tenders)
       .values({ title: 'T1', deadline: new Date(Date.now() + 86400_000), createdBy: bossId })
       .returning();
+await inviteSupplierToAllTenders(testDb, supId);
     const res = await request(app).get(`/api/tenders/${t1.id}`).set(auth(token));
     expect(res.status).toBe(200);
     expect(res.body.myQuote).toBeNull();
