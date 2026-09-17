@@ -7,6 +7,7 @@ import {
   numeric,
   boolean,
   uniqueIndex,
+  index,
 } from 'drizzle-orm/pg-core';
 
 export const userRole = pgEnum('user_role', ['admin', 'supplier']);
@@ -50,4 +51,21 @@ export const quotes = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('quotes_tender_supplier_uq').on(t.tenderId, t.supplierId)],
+);
+
+export const tenderInvitations = pgTable(
+  'tender_invitations',
+  {
+    tenderId: uuid('tender_id')
+      .notNull()
+      .references(() => tenders.id, { onDelete: 'cascade' }),
+    supplierId: uuid('supplier_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    invitedAt: timestamp('invited_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('tender_invitations_tender_supplier_uq').on(t.tenderId, t.supplierId),
+    index('tender_invitations_supplier_idx').on(t.supplierId, t.tenderId),
+  ],
 );
