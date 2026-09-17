@@ -4,7 +4,7 @@ import { api, clearToken, getToken, setToken } from './api';
 export interface CurrentUser {
   id: string;
   username: string;
-  role: 'admin' | 'supplier';
+  role: 'admin' | 'procurement' | 'supplier';
   companyName: string | null;
 }
 
