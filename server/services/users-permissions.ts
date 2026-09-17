@@ -1,7 +1,16 @@
 import { and, eq, or, sql } from 'drizzle-orm';
-import { users as usersTable } from '../db/schema';
+import { users as usersTable, quotes as quotesTable, tenders as tendersTable } from '../db/schema';
 import type { Db } from '../db/client';
 import type { Role } from '../auth/jwt';
+import { systemAdminUsername } from '../env';
+
+/**
+ * 是否是系统内置管理员。
+ * 该账号受保护：列表里看不到；任何 PATCH / DELETE 都被拒绝。
+ */
+export function isSystemAdmin(username: string): boolean {
+  return username === systemAdminUsername();
+}
 
 /**
  * procurement 创建用户：允许 supplier / procurement；禁止 admin。
@@ -16,7 +25,7 @@ export function canCreateRole(actorRole: Role, targetRole: Role): boolean {
 
 /**
  * procurement 可以修改 supplier 账号（且必须是自己创建的）。
- * admin 可以修改任何账号。
+ * admin 可以修改任何非系统管理员账号。
  */
 export function canModifyUser(
   actorRole: Role,
@@ -24,7 +33,10 @@ export function canModifyUser(
   targetCreatedBy: string | null,
   actorId: string,
 ): boolean {
-  if (actorRole === 'admin') return true;
+  if (actorRole === 'admin') {
+    // 留给路由层做系统管理员守卫；这里只放行普通账号
+    return true;
+  }
   if (actorRole === 'procurement') {
     return targetRole === 'supplier' && targetCreatedBy === actorId;
   }
@@ -46,13 +58,23 @@ export function canChangeRole(
 }
 
 /**
- * 列出可见账号。admin 看全部；procurement 看 supplier 全部 + 自己创建的任意角色。
+ * 删除权限：admin 可删除任何非系统管理员账号；procurement/supplier 都不可。
+ */
+export function canDeleteUser(actorRole: Role): boolean {
+  return actorRole === 'admin';
+}
+
+/**
+ * 列出可见账号。
+ * - admin：除系统管理员外的全部账号
+ * - procurement：所有 supplier + 自己创建的非 supplier
  */
 export async function listVisibleUserIds(db: Db, actor: { id: string; role: Role }): Promise<string[]> {
   if (actor.role === 'admin') {
     const rows = await db
-      .select({ id: usersTable.id })
-      .from(usersTable);
+      .select({ id: usersTable.id, username: usersTable.username })
+      .from(usersTable)
+      .where(sql`${usersTable.username} <> ${systemAdminUsername()}`);
     return rows.map((r) => r.id);
   }
   if (actor.role === 'procurement') {
@@ -60,12 +82,34 @@ export async function listVisibleUserIds(db: Db, actor: { id: string; role: Role
       .select({ id: usersTable.id })
       .from(usersTable)
       .where(
-        or(
-          eq(usersTable.role, 'supplier'),
-          eq(usersTable.createdBy, actor.id),
+        and(
+          sql`${usersTable.username} <> ${systemAdminUsername()}`,
+          or(
+            eq(usersTable.role, 'supplier'),
+            eq(usersTable.createdBy, actor.id),
+          ),
         ),
       );
     return rows.map((r) => r.id);
   }
   return [];
+}
+
+/**
+ * 关联数据检查：返回该用户作为创建者创建了多少 tender / quote。
+ * 删除前调用；非 0 时拒绝删除。
+ */
+export async function countUserFootprint(
+  db: Db,
+  userId: string,
+): Promise<{ tenders: number; quotes: number }> {
+  const [tRow] = await db
+    .select({ c: sql<number>`count(*)::int` })
+    .from(tendersTable)
+    .where(eq(tendersTable.createdBy, userId));
+  const [qRow] = await db
+    .select({ c: sql<number>`count(*)::int` })
+    .from(quotesTable)
+    .where(eq(quotesTable.supplierId, userId));
+  return { tenders: tRow?.c ?? 0, quotes: qRow?.c ?? 0 };
 }

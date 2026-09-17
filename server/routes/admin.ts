@@ -15,7 +15,10 @@ import { assertOwnTender } from '../services/admin-guard';
 import {
   canChangeRole,
   canCreateRole,
+  canDeleteUser,
   canModifyUser,
+  countUserFootprint,
+  isSystemAdmin,
   listVisibleUserIds,
 } from '../services/users-permissions';
 import type { Db } from '../db/client';
@@ -82,6 +85,9 @@ export function adminRouter(db: Db) {
     if (!canCreateRole(actor.role, role)) {
       return res.status(403).json({ error: '您无权创建该角色的账号' });
     }
+    if (isSystemAdmin(username)) {
+      return res.status(409).json({ error: '该用户名为系统保留账号' });
+    }
     const [dup] = await db.select({ id: users.id }).from(users).where(eq(users.username, username));
     if (dup) return res.status(409).json({ error: '用户名已存在' });
     const [u] = await db
@@ -109,10 +115,14 @@ export function adminRouter(db: Db) {
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
 
     const [target] = await db
-      .select({ id: users.id, role: users.role, createdBy: users.createdBy })
+      .select({ id: users.id, username: users.username, role: users.role, createdBy: users.createdBy })
       .from(users)
       .where(eq(users.id, req.params.id));
     if (!target) return res.status(404).json({ error: '用户不存在' });
+
+    if (isSystemAdmin(target.username)) {
+      return res.status(403).json({ error: '系统管理员账号受保护，不允许修改' });
+    }
 
     if (!canModifyUser(actor.role, target.role, target.createdBy, actor.id)) {
       return res.status(403).json({ error: '您无权修改该账号' });
@@ -138,6 +148,37 @@ export function adminRouter(db: Db) {
         active: users.active,
       });
     return res.json({ user: u });
+  });
+
+  r.delete('/users/:id', async (req, res) => {
+    const actor = me(req);
+    if (!canDeleteUser(actor.role)) {
+      return res.status(403).json({ error: '仅超级管理员可删除账号' });
+    }
+    const [target] = await db
+      .select({ id: users.id, username: users.username })
+      .from(users)
+      .where(eq(users.id, req.params.id));
+    if (!target) return res.status(404).json({ error: '用户不存在' });
+    if (isSystemAdmin(target.username)) {
+      return res.status(403).json({ error: '系统管理员账号受保护，不允许删除' });
+    }
+    if (target.id === actor.id) {
+      return res.status(403).json({ error: '不能删除自己的账号' });
+    }
+    const fp = await countUserFootprint(db, target.id);
+    if (fp.tenders > 0 || fp.quotes > 0) {
+      return res.status(409).json({
+        error: `该账号有关联数据（创建了 ${fp.tenders} 个招标，提交了 ${fp.quotes} 条报价），请先清理后再删除`,
+      });
+    }
+    // 清理：可能是别人创建的 procurement（应一并把 created_by 置 NULL，避免 FK 失败）
+    await db
+      .update(users)
+      .set({ createdBy: null })
+      .where(eq(users.createdBy, target.id));
+    await db.delete(users).where(eq(users.id, target.id));
+    return res.status(204).send();
   });
 
   // -------- 招标管理 --------

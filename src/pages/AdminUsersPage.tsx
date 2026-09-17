@@ -82,10 +82,6 @@ export default function AdminUsersPage() {
   }
 
   async function resetPassword(u: UserRow) {
-    if (u.role !== 'supplier') {
-      alert('内部账号请用更安全的密码管理流程（本界面仅支持重置供应商密码）');
-      return;
-    }
     const pwd = prompt(`为「${u.companyName ?? u.username}」设置新密码（至少 8 位）：`);
     if (!pwd) return;
     try {
@@ -97,12 +93,20 @@ export default function AdminUsersPage() {
   }
 
   async function toggleActive(u: UserRow) {
-    if (u.role !== 'supplier') {
-      alert('内部账号的停用/启用请谨慎，本界面暂未对内部账号开放');
-      return;
-    }
+    const verb = u.active ? '停用' : '启用';
+    if (!confirm(`确认${verb}账号「${u.companyName ?? u.username}」？`)) return;
     try {
       await api(`/admin/users/${u.id}`, { method: 'PATCH', body: { active: !u.active } });
+      await reload();
+    } catch (err) {
+      alert(err instanceof ApiError ? err.message : '操作失败');
+    }
+  }
+
+  async function deleteUser(u: UserRow) {
+    if (!confirm(`确认永久删除账号「${u.companyName ?? u.username}」？该操作不可撤销。`)) return;
+    try {
+      await api(`/admin/users/${u.id}`, { method: 'DELETE' });
       await reload();
     } catch (err) {
       alert(err instanceof ApiError ? err.message : '操作失败');
@@ -114,6 +118,9 @@ export default function AdminUsersPage() {
     ? ['supplier', 'procurement', 'admin']
     : ['supplier', 'procurement'];
 
+  // 仅超级管理员拥有：重置密码 / 停用 / 删除任何非系统账号
+  const canManageInternal = isAdmin;
+
   return (
     <div className="space-y-6 p-6">
       <div>
@@ -123,8 +130,8 @@ export default function AdminUsersPage() {
         <h1 className="mt-1 text-2xl font-semibold">账号管理</h1>
         <p className="text-xs text-muted-foreground">
           {isAdmin
-            ? '可创建管理员、招标管理员、供应商三种角色'
-            : '可创建供应商与招标管理员账号；不能创建超级管理员'}
+            ? '可创建管理员、招标管理员、供应商账号；系统管理员账号受保护，不会出现在此列表'
+            : '可创建供应商与招标管理员账号；只能看到自己创建的相关账号'}
         </p>
       </div>
 
@@ -200,7 +207,7 @@ export default function AdminUsersPage() {
         <CardHeader>
           <CardTitle>账号列表</CardTitle>
           <CardDescription>
-            {isProcurement ? '所有供应商账号 + 你创建的其他账号' : '全部账号'}
+            {isProcurement ? '所有供应商账号 + 你创建的其他账号' : '除系统管理员外的全部账号'}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -232,7 +239,8 @@ export default function AdminUsersPage() {
                     {formatDateTime(u.createdAt)}
                   </TableCell>
                   <TableCell className="space-x-2 text-right">
-                    {u.role === 'supplier' && (
+                    {/* 超级管理员可以管理所有非系统账号；procurement 只能重置自己创建的 supplier 密码 */}
+                    {canManageInternal || (isProcurement && u.role === 'supplier' && u.createdBy === me?.id) ? (
                       <>
                         <Button variant="outline" size="sm" onClick={() => resetPassword(u)}>
                           重置密码
@@ -245,6 +253,15 @@ export default function AdminUsersPage() {
                           {u.active ? '停用' : '启用'}
                         </Button>
                       </>
+                    ) : null}
+                    {canManageInternal && u.id !== me?.id && (
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={() => deleteUser(u)}
+                      >
+                        删除
+                      </Button>
                     )}
                   </TableCell>
                 </TableRow>

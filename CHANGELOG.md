@@ -6,6 +6,24 @@
 
 ### 待定
 
+## [0.4.0] - 2026-09-17
+
+### 新增
+
+- 系统管理员账号保护：通过 `SYSTEM_ADMIN_USERNAME` 标识（默认 `admin`），列表隐藏 / 禁止修改 / 禁止删除
+- 账号删除：`DELETE /admin/users/:id`，仅 admin 可操作；有关联数据（招标 / 报价）返回 409
+- 超级管理员完整管理面板：可对所有非系统账号执行 重置密码 / 停用 / 启用 / 删除
+
+### 变更
+
+- `users-permissions.ts` 新增 `isSystemAdmin / canDeleteUser / countUserFootprint`，`listVisibleUserIds` 过滤系统管理员
+- 前端 AdminUsersPage 操作按钮对所有非系统账号开放；显示 confirm 二次确认
+- `POST /admin/users` 拒绝创建与系统管理员同名账号（409）
+
+### 兼容性
+
+- 旧部署无需迁移；通过 .env 配置 `SYSTEM_ADMIN_USERNAME`（默认 `admin`）
+
 ## [0.3.0] - 2026-09-17
 
 ### 新增

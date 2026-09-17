@@ -49,11 +49,12 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | id | uuid PK | |
-| username | text UNIQUE NOT NULL | 登录名 |
+| username | text UNIQUE NOT NULL | 登录名（admin / procurement / supplier） |
 | password_hash | text NOT NULL | scrypt（node:crypto，无原生依赖） |
-| role | enum('admin','procurement','supplier') | admin = 超级管理员（看全部）；procurement = 招标管理员（仅看自己创建的招标） |
+| role | enum('admin','procurement','supplier') | admin = 超级管理员（看全部）；procurement = 招标管理员（仅看自己创建的招标与供应商账号）；supplier = 供应商 |
 | company_name | text | 供应商公司名（管理员/采购员可为空） |
 | active | boolean DEFAULT true | 停用后禁止登录 |
+| created_by | uuid NULLABLE FK→users.id | 谁创建了这个账号（系统 seed 的初始 admin 为 NULL；后续谁建就记谁） |
 | created_at | timestamptz | |
 
 ### tenders
@@ -109,6 +110,23 @@
 5. **邀请默认值（2026-09-17 新增）**：创建/编辑招标时，`invitedSupplierIds` 不传或传空数组 = **不邀请任何人**（刻意收紧默认）。
 6. **实时名次**：供应商名次卡片、管理员报价榜均 5 秒轮询。
 7. **管理员多视图隔离（2026-09-17 新增）**：`procurement`（招标管理员）仅能看到与操作自己创建的招标（`tenders.created_by = me`）。`admin`（超级管理员）看全部。`procurement` 可管理供应商账号（与管理员同权）但**禁止修改 `created_by`** 以防止责任转移。`admin` 可以修改任何招标的 `created_by` 以重新指派。procurement 看不到他人创建的招标时统一返回 404（与供应商邀请隔离语义一致）。
+9. **账号管理权限分级（2026-09-17 增量）**：
+   - `GET /users`：admin 看全部；procurement 看 `role=supplier` 全部 + `created_by = me` 的任何角色（看不到其他 procurement 与 admin 创建的 supplier 之外的账号）。
+   - `POST /users`：admin 可创建任意角色；procurement 仅可创建 `supplier` 与 `procurement`，**禁止 `admin`**。
+   - `PATCH /users/:id`（重置密码 / 停用）：admin 任何账号；procurement 仅 `role=supplier` 且 `created_by = me`（不能动其他 procurement 创建的 supplier，也不能动 admin 或其他 procurement）。
+   - 任何角色都不能修改自己的 `role`（防降权）。
+10. **系统管理员账号保护（2026-09-17 增量）**：环境变量 `SYSTEM_ADMIN_USERNAME`（默认 `admin`）标识系统内置账号：
+   - 列表隐藏（admin / procurement 都不看到）
+   - `POST` 拒绝创建同名账号
+   - `PATCH` 任何修改都返回 403
+   - `DELETE` 任何删除都返回 403
+   - 部署后修改该 env 即可重命名系统管理员（重启生效）
+11. **账号硬删除（2026-09-17 增量）**：`DELETE /admin/users/:id`
+   - 仅 admin 可调用
+   - 拒绝删除自己（403）
+   - 拒绝删除系统管理员
+   - 有关联数据（创建了 tender / 提交了 quote）时返回 409，提示用户先清理
+   - 删除 procurement 前，自动把被删账号创建的下属账号的 `created_by` 置 NULL（避免 FK 失败）
 
 ## 5. API 设计
 
@@ -154,7 +172,7 @@
 | /admin | admin | 招标列表：标题、截止时间、状态、报价数（紧凑表格） |
 | /admin/tenders/new | admin | 新建招标表单（含"邀请供应商"多选区，2026-09-17 新增） |
 | /admin/tenders/:id | admin | 招标详情 + 全部报价榜（名次、公司、金额、首次提交、最近更新）+ 编辑（含邀请名单调整）+ 提前关闭 + 单条邀请增删（2026-09-17 新增） |
-| /admin/users | admin | 供应商账号管理：列表、新建、重置密码、停用 |
+| /admin/users | admin | 供应商账号管理：列表（系统管理员隐藏）、新建、重置密码、停用、删除；procurement 受限 |
 | / | supplier | 招标列表（开放中 + 已截止，状态标记），显示我的报价状态/金额/名次徽章 |
 | /tenders/:id | supplier | 招标详情 + 报价表单（金额、备注；截止前可反复修改，截止后只读并提示）+ 我的名次卡片（第 N 名 / 共 M 家，5s 轮询；截止后仍可查看最终名次） |
 
@@ -220,3 +238,12 @@ CREATE DATABASE supplier_quote OWNER supplier_quote;
 | 角色模型 | 加 is_super 布尔 / **加 procurement 角色** | 显式角色比布尔标志可读性更好；与现有 enum 模式一致 |
 | 负责范围 | 多对多指派 / **仅看自己创建的** | 多对多需要额外 join 表；现实场景同一招标通常由单一采购员主导，简单方案足够 |
 | 编辑权 | 仅基本字段 / **可改但不能换主** | procurement 可维护自己创建的招标细节（含邀请名单），但 `created_by` 转给别人会制造责任真空 |
+
+### 增量需求：2026-09-17 账号管理权限分级
+
+| 决策 | 选项 → 选定 | 理由 |
+|---|---|---|
+| procurement 可创建 supplier + procurement | 不能创建 / supplier 独享 / **可创建 supplier+procurement** | 用户明确：采购员应能管理同事账号，但不能"自封"超级管理员 |
+| 列表范围 | 全部 / 只 supplier / **supplier + 自己创建** | 防止 procurement 看到其他同事的账号；与自己相关的可见保证日常协作 |
+| 重置 supplier 密码 | 仅超级管理员 / **procurement 可重置** | 采购员常需为新供应商发初始凭据；重置密码是合理业务需要 |
+| 防止自我降权 | 默认允许 / **禁止自改其 role** | 防止一个 procurement 把自己改成 supplier 来逃避隔离 |
