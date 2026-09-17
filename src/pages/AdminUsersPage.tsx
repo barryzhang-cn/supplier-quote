@@ -1,6 +1,7 @@
 import { useCallback, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
+import { useAuth } from '../auth-context';
 import { usePolling } from '../use-polling';
 import { formatDateTime } from '../lib/utils';
 import { Badge } from '@/components/ui/badge';
@@ -14,7 +15,14 @@ import {
 } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 
 interface UserRow {
   id: string;
@@ -22,6 +30,7 @@ interface UserRow {
   role: 'admin' | 'procurement' | 'supplier';
   companyName: string | null;
   active: boolean;
+  createdBy: string | null;
   createdAt: string;
 }
 
@@ -37,6 +46,9 @@ function roleBadge(role: 'admin' | 'procurement' | 'supplier') {
 }
 
 export default function AdminUsersPage() {
+  const { user: me } = useAuth();
+  const isAdmin = me?.role === 'admin';
+  const isProcurement = me?.role === 'procurement';
   const { data, reload } = usePolling<{ users: UserRow[] }>(
     useCallback(() => api('/admin/users'), []),
   );
@@ -70,17 +82,17 @@ export default function AdminUsersPage() {
   }
 
   async function resetPassword(u: UserRow) {
-    if (u.role === 'supplier') {
-      const pwd = prompt(`为「${u.companyName ?? u.username}」设置新密码（至少 8 位）：`);
-      if (!pwd) return;
-      try {
-        await api(`/admin/users/${u.id}`, { method: 'PATCH', body: { password: pwd } });
-        alert('密码已重置');
-      } catch (err) {
-        alert(err instanceof ApiError ? err.message : '操作失败');
-      }
-    } else {
+    if (u.role !== 'supplier') {
       alert('内部账号请用更安全的密码管理流程（本界面仅支持重置供应商密码）');
+      return;
+    }
+    const pwd = prompt(`为「${u.companyName ?? u.username}」设置新密码（至少 8 位）：`);
+    if (!pwd) return;
+    try {
+      await api(`/admin/users/${u.id}`, { method: 'PATCH', body: { password: pwd } });
+      alert('密码已重置');
+    } catch (err) {
+      alert(err instanceof ApiError ? err.message : '操作失败');
     }
   }
 
@@ -97,6 +109,11 @@ export default function AdminUsersPage() {
     }
   }
 
+  // procurement 看到的可创建角色：supplier + procurement（不能选 admin）
+  const availableRoles: Array<'procurement' | 'supplier' | 'admin'> = isAdmin
+    ? ['supplier', 'procurement', 'admin']
+    : ['supplier', 'procurement'];
+
   return (
     <div className="space-y-6 p-6">
       <div>
@@ -104,7 +121,11 @@ export default function AdminUsersPage() {
           ← 返回
         </Link>
         <h1 className="mt-1 text-2xl font-semibold">账号管理</h1>
-        <p className="text-xs text-muted-foreground">可创建管理员、招标管理员、供应商三种角色</p>
+        <p className="text-xs text-muted-foreground">
+          {isAdmin
+            ? '可创建管理员、招标管理员、供应商三种角色'
+            : '可创建供应商与招标管理员账号；不能创建超级管理员'}
+        </p>
       </div>
 
       <Card>
@@ -144,12 +165,20 @@ export default function AdminUsersPage() {
               <Label>角色</Label>
               <select
                 value={role}
-                onChange={(e) => setRole(e.target.value as 'admin' | 'procurement' | 'supplier')}
+                onChange={(e) =>
+                  setRole(e.target.value as 'admin' | 'procurement' | 'supplier')
+                }
                 className="flex h-9 w-full rounded-md border border-input bg-card px-3 py-1 text-sm"
               >
-                <option value="supplier">供应商</option>
-                <option value="procurement">招标管理员</option>
-                <option value="admin">超级管理员</option>
+                {availableRoles.map((r) => (
+                  <option key={r} value={r}>
+                    {r === 'supplier'
+                      ? '供应商'
+                      : r === 'procurement'
+                      ? '招标管理员'
+                      : '超级管理员'}
+                  </option>
+                ))}
               </select>
             </div>
             <div className="md:col-span-4">
@@ -170,6 +199,9 @@ export default function AdminUsersPage() {
       <Card>
         <CardHeader>
           <CardTitle>账号列表</CardTitle>
+          <CardDescription>
+            {isProcurement ? '所有供应商账号 + 你创建的其他账号' : '全部账号'}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <Table>
@@ -200,19 +232,30 @@ export default function AdminUsersPage() {
                     {formatDateTime(u.createdAt)}
                   </TableCell>
                   <TableCell className="space-x-2 text-right">
-                    <Button variant="outline" size="sm" onClick={() => resetPassword(u)}>
-                      重置密码
-                    </Button>
-                    <Button
-                      variant={u.active ? 'destructive' : 'outline'}
-                      size="sm"
-                      onClick={() => toggleActive(u)}
-                    >
-                      {u.active ? '停用' : '启用'}
-                    </Button>
+                    {u.role === 'supplier' && (
+                      <>
+                        <Button variant="outline" size="sm" onClick={() => resetPassword(u)}>
+                          重置密码
+                        </Button>
+                        <Button
+                          variant={u.active ? 'destructive' : 'outline'}
+                          size="sm"
+                          onClick={() => toggleActive(u)}
+                        >
+                          {u.active ? '停用' : '启用'}
+                        </Button>
+                      </>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
+              {data && data.users.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
+                    暂无账号
+                  </TableCell>
+                </TableRow>
+              )}
             </TableBody>
           </Table>
         </CardContent>
