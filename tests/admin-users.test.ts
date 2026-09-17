@@ -41,7 +41,7 @@ describe('管理员-供应商账号管理', () => {
     expect(res.status).toBe(422);
   });
 
-  it('列表只含供应商且不泄露密码哈希', async () => {
+  it('列表返回全部用户且不泄露密码哈希', async () => {
     const app = createApp(testDb);
     await insertUser(testDb, { username: 'boss', role: 'admin' });
     await insertUser(testDb, { username: 'sup1', companyName: '甲公司' });
@@ -50,10 +50,10 @@ describe('管理员-供应商账号管理', () => {
     const res = await request(app).get('/api/admin/users').set(auth(token));
     expect(res.status).toBe(200);
     const names = res.body.users.map((u: { username: string }) => u.username);
-    expect(names).toContain('sup1');
-    expect(names).not.toContain('boss');
-    expect(names).not.toContain('other_admin');
+    expect(names).toEqual(expect.arrayContaining(['sup1', 'boss', 'other_admin']));
     expect(res.body.users[0]).not.toHaveProperty('passwordHash');
+    // 含 role 字段
+    expect(res.body.users[0]).toHaveProperty('role');
   });
 
   it('重置密码后新密码可登录、旧密码失效', async () => {

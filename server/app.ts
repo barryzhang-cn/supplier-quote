@@ -14,7 +14,7 @@ export function createApp(db: Db) {
 
   const requireAuthMw = requireAuth(db);
   app.use('/api/auth', authRouter(db));
-  app.use('/api/admin', requireAuthMw, requireRole('admin'), adminRouter(db));
+  app.use('/api/admin', requireAuthMw, requireRole(['admin', 'procurement']), adminRouter(db));
   app.use('/api', requireAuthMw, requireRole('supplier'), supplierRouter(db));
 
   const clientDir = path.resolve(process.cwd(), 'dist/client');

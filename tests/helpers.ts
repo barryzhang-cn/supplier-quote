@@ -9,7 +9,7 @@ export async function insertUser(
   db: Db,
   opts: {
     username: string;
-    role?: 'admin' | 'supplier';
+    role?: 'admin' | 'procurement' | 'supplier';
     companyName?: string | null;
     active?: boolean;
     password?: string;

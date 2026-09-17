@@ -22,7 +22,7 @@ export function verifyToken(token: string): TokenPayload | null {
     const decoded = jwt.verify(token, secret());
     if (typeof decoded === 'string') return null;
     const { sub, role } = decoded as jwt.JwtPayload;
-    if (typeof sub !== 'string' || (role !== 'admin' && role !== 'supplier')) return null;
+    if (typeof sub !== 'string' || (role !== 'admin' && role !== 'procurement' && role !== 'supplier')) return null;
     return { sub, role };
   } catch {
     return null;

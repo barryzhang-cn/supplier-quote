@@ -11,6 +11,7 @@ import {
   removeInvitation,
   replaceInvitations,
 } from '../services/invitations';
+import { assertOwnTender } from '../services/admin-guard';
 import type { Db } from '../db/client';
 
 const createUserSchema = z.object({
@@ -20,7 +21,8 @@ const createUserSchema = z.object({
     .max(50)
     .regex(/^[\w.-]+$/, '用户名仅限字母、数字、._-'),
   password: z.string().min(8, '密码至少 8 位').max(72),
-  companyName: z.string().min(1, '公司名称必填').max(100),
+  companyName: z.string().min(1, '公司名称必填').max(100).optional(),
+  role: z.enum(['admin', 'procurement', 'supplier']).default('supplier'),
 });
 
 const patchUserSchema = z.object({
@@ -33,6 +35,7 @@ const tenderBodySchema = z.object({
   description: z.string().max(5000).nullish(),
   deadline: z.string().datetime({ offset: true }),
   invitedSupplierIds: z.array(z.string().uuid()).optional(),
+  createdBy: z.string().uuid().optional(),
 });
 
 const addInvitationSchema = z.object({
@@ -42,18 +45,18 @@ const addInvitationSchema = z.object({
 export function adminRouter(db: Db) {
   const r = Router();
 
-  // -------- 供应商账号管理 --------
+  // -------- 供应商账号管理（admin + procurement 都可） --------
   r.get('/users', async (_req, res) => {
     const rows = await db
       .select({
         id: users.id,
         username: users.username,
+        role: users.role,
         companyName: users.companyName,
         active: users.active,
         createdAt: users.createdAt,
       })
       .from(users)
-      .where(eq(users.role, 'supplier'))
       .orderBy(users.createdAt);
     res.json({ users: rows });
   });
@@ -61,7 +64,7 @@ export function adminRouter(db: Db) {
   r.post('/users', async (req, res) => {
     const parsed = createUserSchema.safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
-    const { username, password, companyName } = parsed.data;
+    const { username, password, companyName, role } = parsed.data;
     const [dup] = await db.select({ id: users.id }).from(users).where(eq(users.username, username));
     if (dup) return res.status(409).json({ error: '用户名已存在' });
     const [u] = await db
@@ -69,10 +72,15 @@ export function adminRouter(db: Db) {
       .values({
         username,
         passwordHash: hashPassword(password),
-        role: 'supplier',
-        companyName,
+        role,
+        companyName: companyName ?? null,
       })
-      .returning({ id: users.id, username: users.username, companyName: users.companyName, role: users.role });
+      .returning({
+        id: users.id,
+        username: users.username,
+        companyName: users.companyName,
+        role: users.role,
+      });
     return res.status(201).json({ user: u });
   });
 
@@ -87,20 +95,29 @@ export function adminRouter(db: Db) {
       .update(users)
       .set(values)
       .where(eq(users.id, req.params.id))
-      .returning({ id: users.id, username: users.username, active: users.active });
+      .returning({
+        id: users.id,
+        username: users.username,
+        role: users.role,
+        active: users.active,
+      });
     if (!u) return res.status(404).json({ error: '用户不存在' });
     return res.json({ user: u });
   });
 
   // -------- 招标管理 --------
-  r.get('/tenders', async (_req, res) => {
-    const rows = await db
+  const me = (req: import('express').Request) => currentUser(req);
+
+  r.get('/tenders', async (req, res) => {
+    const user = me(req);
+    const baseSelect = db
       .select({
         id: tenders.id,
         title: tenders.title,
         description: tenders.description,
         deadline: tenders.deadline,
         status: tenders.status,
+        createdBy: tenders.createdBy,
         createdAt: tenders.createdAt,
         quoteCount: sql<number>`count(${quotes.id})::int`,
       })
@@ -108,21 +125,29 @@ export function adminRouter(db: Db) {
       .leftJoin(quotes, eq(quotes.tenderId, tenders.id))
       .groupBy(tenders.id)
       .orderBy(desc(tenders.createdAt));
+    const rows =
+      user.role === 'procurement'
+        ? await baseSelect.where(eq(tenders.createdBy, user.id))
+        : await baseSelect;
     res.json({ tenders: rows });
   });
 
   r.post('/tenders', async (req, res) => {
     const parsed = tenderBodySchema.safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
+    const user = me(req);
     const deadline = new Date(parsed.data.deadline);
     if (deadline.getTime() <= Date.now()) return res.status(422).json({ error: '截止时间必须晚于当前时间' });
+    // procurement 创建时 created_by 强制 = me；admin 可选（默认 me，可指定他人）
+    let createdBy = user.id;
+    if (user.role === 'admin' && parsed.data.createdBy) createdBy = parsed.data.createdBy;
     const [t] = await db
       .insert(tenders)
       .values({
         title: parsed.data.title,
         description: parsed.data.description ?? null,
         deadline,
-        createdBy: currentUser(req).id,
+        createdBy,
       })
       .returning();
     if (parsed.data.invitedSupplierIds !== undefined) {
@@ -133,8 +158,9 @@ export function adminRouter(db: Db) {
   });
 
   r.get('/tenders/:id', async (req, res) => {
+    const user = me(req);
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
-    if (!t) return res.status(404).json({ error: '招标不存在' });
     const rows = await db
       .select({
         id: quotes.id,
@@ -157,8 +183,9 @@ export function adminRouter(db: Db) {
   });
 
   r.patch('/tenders/:id', async (req, res) => {
+    const user = me(req);
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
-    if (!t) return res.status(404).json({ error: '招标不存在' });
     const parsed = tenderBodySchema.partial().safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
     const editingLockRelevant =
@@ -168,13 +195,17 @@ export function adminRouter(db: Db) {
     if (editingLockRelevant && (t.status === 'closed' || t.deadline.getTime() <= Date.now())) {
       return res.status(409).json({ error: '招标已截止或已关闭，不可编辑' });
     }
-    const values: { title?: string; description?: string | null; deadline?: Date } = {};
+    const values: { title?: string; description?: string | null; deadline?: Date; createdBy?: string } = {};
     if (parsed.data.title !== undefined) values.title = parsed.data.title;
     if (parsed.data.description !== undefined) values.description = parsed.data.description ?? null;
     if (parsed.data.deadline !== undefined) {
       const d = new Date(parsed.data.deadline);
       if (d.getTime() <= Date.now()) return res.status(422).json({ error: '截止时间必须晚于当前时间' });
       values.deadline = d;
+    }
+    // 只有 admin 可以修改 created_by（重新指派）；procurement 忽略
+    if (user.role === 'admin' && parsed.data.createdBy !== undefined) {
+      values.createdBy = parsed.data.createdBy;
     }
     if (Object.keys(values).length > 0) {
       await db.update(tenders).set(values).where(eq(tenders.id, t.id));
@@ -188,8 +219,9 @@ export function adminRouter(db: Db) {
   });
 
   r.post('/tenders/:id/close', async (req, res) => {
+    const user = me(req);
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
-    if (!t) return res.status(404).json({ error: '招标不存在' });
     if (t.status === 'closed') return res.status(409).json({ error: '招标已关闭' });
     const [updated] = await db
       .update(tenders)
@@ -200,13 +232,13 @@ export function adminRouter(db: Db) {
     return res.json({ tender: { ...updated, invitedSupplierIds } });
   });
 
-  // -------- 邀请管理（不受截止/关闭守卫） --------
   r.post('/tenders/:id/invitations', async (req, res) => {
+    const user = me(req);
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
     const [t] = await db
       .select({ id: tenders.id })
       .from(tenders)
       .where(eq(tenders.id, req.params.id));
-    if (!t) return res.status(404).json({ error: '招标不存在' });
     const parsed = addInvitationSchema.safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
     try {
@@ -222,11 +254,12 @@ export function adminRouter(db: Db) {
   });
 
   r.delete('/tenders/:id/invitations/:supplierId', async (req, res) => {
+    const user = me(req);
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
     const [t] = await db
       .select({ id: tenders.id })
       .from(tenders)
       .where(eq(tenders.id, req.params.id));
-    if (!t) return res.status(404).json({ error: '招标不存在' });
     await removeInvitation(db, t.id, req.params.supplierId);
     return res.status(204).send();
   });
