@@ -8,6 +8,7 @@ import {
   boolean,
   uniqueIndex,
   index,
+  type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 
 export const userRole = pgEnum('user_role', ['admin', 'procurement', 'supplier']);
@@ -20,6 +21,7 @@ export const users = pgTable('users', {
   role: userRole('role').notNull().default('supplier'),
   companyName: text('company_name'),
   active: boolean('active').notNull().default(true),
+  createdBy: uuid('created_by').references((): AnyPgColumn => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
