@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 
-export type Role = 'admin' | 'supplier';
+export type Role = 'admin' | 'procurement' | 'supplier';
 
 export interface TokenPayload {
   sub: string;

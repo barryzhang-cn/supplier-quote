@@ -1,13 +1,13 @@
 import type { Request, Response, NextFunction } from 'express';
 import { eq } from 'drizzle-orm';
 import { users } from '../db/schema';
-import { verifyToken } from './jwt';
+import { verifyToken, type Role } from './jwt';
 import type { Db } from '../db/client';
 
 export interface AuthedUser {
   id: string;
   username: string;
-  role: 'admin' | 'supplier';
+  role: Role;
   companyName: string | null;
 }
 
@@ -37,15 +37,16 @@ export function requireAuth(db: Db) {
       .where(eq(users.id, payload.sub));
     if (!u) return res.status(401).json({ error: '账号不存在' });
     if (!u.active) return res.status(403).json({ error: '账号已停用' });
-    (req as AuthedRequest).user = u;
+    (req as AuthedRequest).user = u as AuthedUser;
     next();
   };
 }
 
-export function requireRole(role: 'admin' | 'supplier') {
+export function requireRole(role: Role | Role[]) {
+  const allowed = Array.isArray(role) ? role : [role];
   return (req: Request, res: Response, next: NextFunction) => {
     const user = (req as AuthedRequest).user;
-    if (!user || user.role !== role) return res.status(403).json({ error: '无权限' });
+    if (!user || !allowed.includes(user.role)) return res.status(403).json({ error: '无权限' });
     next();
   };
 }

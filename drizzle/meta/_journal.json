@@ -15,6 +15,13 @@
       "when": 1789621750319,
       "tag": "0001_loud_sunset_bain",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789625995395,
+      "tag": "0002_easy_rick_jones",
+      "breakpoints": true
     }
   ]
 }

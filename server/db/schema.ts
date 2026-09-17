@@ -10,7 +10,7 @@ import {
   index,
 } from 'drizzle-orm/pg-core';
 
-export const userRole = pgEnum('user_role', ['admin', 'supplier']);
+export const userRole = pgEnum('user_role', ['admin', 'procurement', 'supplier']);
 export const tenderStatus = pgEnum('tender_status', ['open', 'closed']);
 
 export const users = pgTable('users', {
