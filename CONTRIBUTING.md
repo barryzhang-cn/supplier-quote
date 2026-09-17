@@ -1,12 +1,15 @@
 # 贡献指南
 
+欢迎任何形式的贡献 —— 从一个错别字到一次重构、新功能、新 ADR。
+
 ## 提交流程
 
-1. Fork 仓库（个人私有仓可跳过此步）
-2. 在 `feat/<short-name>` 分支开发：`git checkout -b feat/<short-name>`
-3. 提交粒度细，commit message 用中文简述：`feat: 邀请名单增量` / `fix: 截止后 PATCH 报错`
-4. 推送前 `npm test && npm run typecheck` 必须通过
-5. 推送触发 reviewer（个人私有仓可省略）
+1. **Fork** 本仓库
+2. **创建分支**：`git checkout -b feat/<short-name>` 或 `fix/<short-name>`
+3. **提交粒度细**：commit message 用中文简述（例：`feat: 邀请名单增量` / `fix: 截止后 PATCH 报错` / `docs: 更新 ADR 005`）
+5. **本地验证**：`npm test && npm run typecheck && npm run build` 全部通过
+6. **推送**：`git push origin feat/<short-name>`
+7. **提 PR**：描述改了什么、为何、测试如何覆盖；链接相关 Issue
 
 ## 开发规范
 

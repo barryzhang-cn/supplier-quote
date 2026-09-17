@@ -1,0 +1,19 @@
+# 默认所有文件需 owner review
+* @barryzhang-cn
+
+# 设计 / ADR 需作者确认
+/docs/decisions/ @barryzhang-cn
+/docs/design/ @barryzhang-cn
+
+# 数据库 schema 与迁移
+/server/db/ @barryzhang-cn
+/drizzle/ @barryzhang-cn
+
+# 部署 / Docker
+/Dockerfile @barryzhang-cn
+/docker-compose.yml @barryzhang-cn
+/.dockerignore @barryzhang-cn
+
+# 文档
+README.md @barryzhang-cn
+SECURITY.md @barryzhang-cn
