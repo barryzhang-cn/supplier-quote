@@ -5,6 +5,12 @@ import { users, tenders, quotes } from '../db/schema';
 import { hashPassword } from '../auth/password';
 import { currentUser } from '../auth/middleware';
 import { computeRanks } from '../services/ranking';
+import {
+  addInvitation,
+  listInvitedSupplierIds,
+  removeInvitation,
+  replaceInvitations,
+} from '../services/invitations';
 import type { Db } from '../db/client';
 
 const createUserSchema = z.object({
@@ -26,6 +32,11 @@ const tenderBodySchema = z.object({
   title: z.string().min(1).max(200),
   description: z.string().max(5000).nullish(),
   deadline: z.string().datetime({ offset: true }),
+  invitedSupplierIds: z.array(z.string().uuid()).optional(),
+});
+
+const addInvitationSchema = z.object({
+  supplierId: z.string().uuid(),
 });
 
 export function adminRouter(db: Db) {
@@ -114,7 +125,11 @@ export function adminRouter(db: Db) {
         createdBy: currentUser(req).id,
       })
       .returning();
-    return res.status(201).json({ tender: t });
+    if (parsed.data.invitedSupplierIds !== undefined) {
+      await replaceInvitations(db, t.id, parsed.data.invitedSupplierIds);
+    }
+    const invitedSupplierIds = await listInvitedSupplierIds(db, t.id);
+    return res.status(201).json({ tender: { ...t, invitedSupplierIds } });
   });
 
   r.get('/tenders/:id', async (req, res) => {
@@ -137,17 +152,22 @@ export function adminRouter(db: Db) {
     const board = rows
       .map((q) => ({ ...q, rank: ranks.get(q.supplierId)! }))
       .sort((a, b) => a.rank - b.rank);
-    return res.json({ tender: t, quotes: board });
+    const invitedSupplierIds = await listInvitedSupplierIds(db, t.id);
+    return res.json({ tender: { ...t, invitedSupplierIds }, quotes: board });
   });
 
   r.patch('/tenders/:id', async (req, res) => {
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
     if (!t) return res.status(404).json({ error: '招标不存在' });
-    if (t.status === 'closed' || t.deadline.getTime() <= Date.now()) {
-      return res.status(409).json({ error: '招标已截止或已关闭，不可编辑' });
-    }
     const parsed = tenderBodySchema.partial().safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
+    const editingLockRelevant =
+      parsed.data.title !== undefined ||
+      parsed.data.description !== undefined ||
+      parsed.data.deadline !== undefined;
+    if (editingLockRelevant && (t.status === 'closed' || t.deadline.getTime() <= Date.now())) {
+      return res.status(409).json({ error: '招标已截止或已关闭，不可编辑' });
+    }
     const values: { title?: string; description?: string | null; deadline?: Date } = {};
     if (parsed.data.title !== undefined) values.title = parsed.data.title;
     if (parsed.data.description !== undefined) values.description = parsed.data.description ?? null;
@@ -156,9 +176,15 @@ export function adminRouter(db: Db) {
       if (d.getTime() <= Date.now()) return res.status(422).json({ error: '截止时间必须晚于当前时间' });
       values.deadline = d;
     }
-    if (Object.keys(values).length === 0) return res.status(422).json({ error: '无可更新字段' });
-    const [updated] = await db.update(tenders).set(values).where(eq(tenders.id, t.id)).returning();
-    return res.json({ tender: updated });
+    if (Object.keys(values).length > 0) {
+      await db.update(tenders).set(values).where(eq(tenders.id, t.id));
+    }
+    if (parsed.data.invitedSupplierIds !== undefined) {
+      await replaceInvitations(db, t.id, parsed.data.invitedSupplierIds);
+    }
+    const [updated] = await db.select().from(tenders).where(eq(tenders.id, t.id));
+    const invitedSupplierIds = await listInvitedSupplierIds(db, t.id);
+    return res.json({ tender: { ...updated, invitedSupplierIds } });
   });
 
   r.post('/tenders/:id/close', async (req, res) => {
@@ -170,7 +196,39 @@ export function adminRouter(db: Db) {
       .set({ status: 'closed' })
       .where(and(eq(tenders.id, t.id), eq(tenders.status, 'open')))
       .returning();
-    return res.json({ tender: updated });
+    const invitedSupplierIds = await listInvitedSupplierIds(db, t.id);
+    return res.json({ tender: { ...updated, invitedSupplierIds } });
+  });
+
+  // -------- 邀请管理（不受截止/关闭守卫） --------
+  r.post('/tenders/:id/invitations', async (req, res) => {
+    const [t] = await db
+      .select({ id: tenders.id })
+      .from(tenders)
+      .where(eq(tenders.id, req.params.id));
+    if (!t) return res.status(404).json({ error: '招标不存在' });
+    const parsed = addInvitationSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
+    try {
+      await addInvitation(db, t.id, parsed.data.supplierId);
+    } catch (e) {
+      if ((e as { code?: number }).code === 422) {
+        return res.status(422).json({ error: (e as Error).message });
+      }
+      throw e;
+    }
+    const invitedSupplierIds = await listInvitedSupplierIds(db, t.id);
+    return res.status(201).json({ invitedSupplierIds });
+  });
+
+  r.delete('/tenders/:id/invitations/:supplierId', async (req, res) => {
+    const [t] = await db
+      .select({ id: tenders.id })
+      .from(tenders)
+      .where(eq(tenders.id, req.params.id));
+    if (!t) return res.status(404).json({ error: '招标不存在' });
+    await removeInvitation(db, t.id, req.params.supplierId);
+    return res.status(204).send();
   });
 
   return r;
