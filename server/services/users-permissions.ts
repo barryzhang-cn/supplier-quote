@@ -1,4 +1,4 @@
-import { and, eq, or, sql } from 'drizzle-orm';
+import { and, eq, or, sql, type SQL } from 'drizzle-orm';
 import { users as usersTable, quotes as quotesTable, tenders as tendersTable } from '../db/schema';
 import type { Db } from '../db/client';
 import type { Role } from '../auth/jwt';
@@ -58,23 +58,51 @@ export function canChangeRole(
 }
 
 /**
- * 删除权限：admin 可删除任何非系统管理员账号；procurement/supplier 都不可。
+ * 删除权限：
+ * - admin：任何非系统管理员账号（系统管理员守卫在路由层）
+ * - procurement：仅自己创建的 supplier
+ * - supplier：不能删任何账号
  */
-export function canDeleteUser(actorRole: Role): boolean {
-  return actorRole === 'admin';
+export function canDeleteUser(
+  actorRole: Role,
+  targetRole: Role,
+  targetCreatedBy: string | null,
+  actorId: string,
+): boolean {
+  if (actorRole === 'admin') return true;
+  if (actorRole === 'procurement') {
+    return targetRole === 'supplier' && targetCreatedBy === actorId;
+  }
+  return false;
 }
 
 /**
  * 列出可见账号。
  * - admin：除系统管理员外的全部账号
  * - procurement：所有 supplier + 自己创建的非 supplier
+ *
+ * `q`：模糊匹配 username / companyName（大小写不敏感）
  */
-export async function listVisibleUserIds(db: Db, actor: { id: string; role: Role }): Promise<string[]> {
+export async function listVisibleUserIds(
+  db: Db,
+  actor: { id: string; role: Role },
+  q?: string,
+): Promise<string[]> {
+  const conds: (SQL | undefined)[] = [
+    sql`${usersTable.username} <> ${systemAdminUsername()}`,
+  ];
+  const term = q?.trim();
+  if (term) {
+    const like = `%${term.toLowerCase()}%`;
+    conds.push(
+      sql`(lower(${usersTable.username}) LIKE ${like} OR lower(coalesce(${usersTable.companyName}, '')) LIKE ${like})`,
+    );
+  }
   if (actor.role === 'admin') {
     const rows = await db
-      .select({ id: usersTable.id, username: usersTable.username })
+      .select({ id: usersTable.id })
       .from(usersTable)
-      .where(sql`${usersTable.username} <> ${systemAdminUsername()}`);
+      .where(and(...conds));
     return rows.map((r) => r.id);
   }
   if (actor.role === 'procurement') {
@@ -83,7 +111,7 @@ export async function listVisibleUserIds(db: Db, actor: { id: string; role: Role
       .from(usersTable)
       .where(
         and(
-          sql`${usersTable.username} <> ${systemAdminUsername()}`,
+          ...conds,
           or(
             eq(usersTable.role, 'supplier'),
             eq(usersTable.createdBy, actor.id),

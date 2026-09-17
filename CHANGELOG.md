@@ -6,6 +6,19 @@
 
 ### 待定
 
+## [0.5.0] - 2026-09-17
+
+### 新增
+
+- 账号列表搜索：`GET /admin/users?q=<keyword>`，模糊匹配 username / companyName（大小写不敏感）
+- 创建者列：返回 `createdByUsername` 字段，前端表格新增「创建者」列；系统管理员创建的账号显示「系统」
+- procurement 可删除自己创建的 supplier（仍受关联数据校验）
+
+### 变更
+
+- `DELETE /admin/users/:id` 守卫：procurement 仅能删自己创建的 supplier；其它角色由 su 改为基于 `canDeleteUser(actor, target)` 细粒度判断
+- 前端 AdminUsersPage 用 `useEffect + setTimeout(300ms)` 防抖搜索；新增「创建者」列
+
 ## [0.4.0] - 2026-09-17
 
 ### 新增

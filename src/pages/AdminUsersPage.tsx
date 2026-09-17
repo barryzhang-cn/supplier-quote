@@ -1,8 +1,7 @@
-import { useCallback, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import { useAuth } from '../auth-context';
-import { usePolling } from '../use-polling';
 import { formatDateTime } from '../lib/utils';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -31,6 +30,7 @@ interface UserRow {
   companyName: string | null;
   active: boolean;
   createdBy: string | null;
+  createdByUsername: string | null;
   createdAt: string;
 }
 
@@ -49,9 +49,8 @@ export default function AdminUsersPage() {
   const { user: me } = useAuth();
   const isAdmin = me?.role === 'admin';
   const isProcurement = me?.role === 'procurement';
-  const { data, reload } = usePolling<{ users: UserRow[] }>(
-    useCallback(() => api('/admin/users'), []),
-  );
+  const [q, setQ] = useState('');
+  const [data, setData] = useState<{ users: UserRow[] } | null>(null);
   const [username, setUsername] = useState('');
   const [companyName, setCompanyName] = useState('');
   const [password, setPassword] = useState('');
@@ -59,6 +58,30 @@ export default function AdminUsersPage() {
   const [created, setCreated] = useState<{ username: string; password: string; role: string } | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  const fetchUsers = useCallback(async (search: string) => {
+    const qs = search.trim() ? `?q=${encodeURIComponent(search.trim())}` : '';
+    const res = await api<{ users: UserRow[] }>(`/admin/users${qs}`);
+    setData(res);
+  }, []);
+
+  // 输入防抖：300ms 后才发请求；立刻响应仍可触发 reload
+  useEffect(() => {
+    const t = setTimeout(() => {
+      fetchUsers(q).catch((err) => {
+        if (err instanceof ApiError) setError(err.message);
+      });
+    }, 300);
+    return () => clearTimeout(t);
+  }, [q, fetchUsers]);
+
+  async function reload() {
+    try {
+      await fetchUsers(q);
+    } catch (err) {
+      if (err instanceof ApiError) setError(err.message);
+    }
+  }
 
   async function createUser(e: FormEvent) {
     e.preventDefault();
@@ -118,8 +141,16 @@ export default function AdminUsersPage() {
     ? ['supplier', 'procurement', 'admin']
     : ['supplier', 'procurement'];
 
-  // 仅超级管理员拥有：重置密码 / 停用 / 删除任何非系统账号
-  const canManageInternal = isAdmin;
+  // 当前用户对该行的可操作权限
+  function canManage(u: UserRow): boolean {
+    if (isAdmin) return u.id !== me?.id;
+    if (isProcurement) return u.role === 'supplier' && u.createdBy === me?.id;
+    return false;
+  }
+  // 删除权限（仅自己有完整管理权时允许）
+  function canDelete(u: UserRow): boolean {
+    return canManage(u);
+  }
 
   return (
     <div className="space-y-6 p-6">
@@ -211,12 +242,30 @@ export default function AdminUsersPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          <div className="mb-3 flex items-center gap-2">
+            <Input
+              placeholder="按用户名或公司名搜索…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              className="max-w-xs"
+            />
+            {q && (
+              <Button variant="ghost" size="sm" onClick={() => setQ('')}>
+                清除
+              </Button>
+            )}
+            <span className="ml-auto text-xs text-muted-foreground">
+              {(data?.users ?? []).length} 条
+            </span>
+          </div>
+
           <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>角色</TableHead>
                 <TableHead>公司 / 显示名</TableHead>
                 <TableHead>用户名</TableHead>
+                <TableHead>创建者</TableHead>
                 <TableHead>状态</TableHead>
                 <TableHead>创建时间</TableHead>
                 <TableHead />
@@ -228,6 +277,9 @@ export default function AdminUsersPage() {
                   <TableCell>{roleBadge(u.role)}</TableCell>
                   <TableCell className="font-medium">{u.companyName ?? '-'}</TableCell>
                   <TableCell>{u.username}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {u.createdByUsername ?? <span className="opacity-50">系统</span>}
+                  </TableCell>
                   <TableCell>
                     {u.active ? (
                       <Badge variant="success">启用</Badge>
@@ -239,8 +291,7 @@ export default function AdminUsersPage() {
                     {formatDateTime(u.createdAt)}
                   </TableCell>
                   <TableCell className="space-x-2 text-right">
-                    {/* 超级管理员可以管理所有非系统账号；procurement 只能重置自己创建的 supplier 密码 */}
-                    {canManageInternal || (isProcurement && u.role === 'supplier' && u.createdBy === me?.id) ? (
+                    {canManage(u) && (
                       <>
                         <Button variant="outline" size="sm" onClick={() => resetPassword(u)}>
                           重置密码
@@ -253,8 +304,8 @@ export default function AdminUsersPage() {
                           {u.active ? '停用' : '启用'}
                         </Button>
                       </>
-                    ) : null}
-                    {canManageInternal && u.id !== me?.id && (
+                    )}
+                    {canDelete(u) && (
                       <Button
                         variant="destructive"
                         size="sm"
@@ -268,8 +319,8 @@ export default function AdminUsersPage() {
               ))}
               {data && data.users.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
-                    暂无账号
+                  <TableCell colSpan={7} className="py-8 text-center text-muted-foreground">
+                    {q ? `没有匹配「${q}」的账号` : '暂无账号'}
                   </TableCell>
                 </TableRow>
               )}

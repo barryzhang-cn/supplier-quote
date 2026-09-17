@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, sql, aliasedTable } from 'drizzle-orm';
 import { z } from 'zod';
 import { users, tenders, quotes } from '../db/schema';
 import { hashPassword } from '../auth/password';
@@ -59,8 +59,11 @@ export function adminRouter(db: Db) {
   // -------- 账号管理（admin + procurement，但 procurement 受限） --------
   r.get('/users', async (req, res) => {
     const user = me(req);
-    const ids = await listVisibleUserIds(db, { id: user.id, role: user.role });
+    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    const ids = await listVisibleUserIds(db, { id: user.id, role: user.role }, q);
     if (ids.length === 0) return res.json({ users: [] });
+    // 关联查创建者 username（自连接：creator 别名）
+    const creator = aliasedTable(users, 'creator');
     const rows = await db
       .select({
         id: users.id,
@@ -69,9 +72,11 @@ export function adminRouter(db: Db) {
         companyName: users.companyName,
         active: users.active,
         createdBy: users.createdBy,
+        createdByUsername: creator.username,
         createdAt: users.createdAt,
       })
       .from(users)
+      .leftJoin(creator, eq(creator.id, users.createdBy))
       .where(sql`${users.id} = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(',')}]::uuid[]`)})`)
       .orderBy(users.createdAt);
     res.json({ users: rows });
@@ -152,11 +157,8 @@ export function adminRouter(db: Db) {
 
   r.delete('/users/:id', async (req, res) => {
     const actor = me(req);
-    if (!canDeleteUser(actor.role)) {
-      return res.status(403).json({ error: '仅超级管理员可删除账号' });
-    }
     const [target] = await db
-      .select({ id: users.id, username: users.username })
+      .select({ id: users.id, username: users.username, role: users.role, createdBy: users.createdBy })
       .from(users)
       .where(eq(users.id, req.params.id));
     if (!target) return res.status(404).json({ error: '用户不存在' });
@@ -166,13 +168,16 @@ export function adminRouter(db: Db) {
     if (target.id === actor.id) {
       return res.status(403).json({ error: '不能删除自己的账号' });
     }
+    if (!canDeleteUser(actor.role, target.role, target.createdBy, actor.id)) {
+      return res.status(403).json({ error: '您无权删除该账号' });
+    }
     const fp = await countUserFootprint(db, target.id);
     if (fp.tenders > 0 || fp.quotes > 0) {
       return res.status(409).json({
         error: `该账号有关联数据（创建了 ${fp.tenders} 个招标，提交了 ${fp.quotes} 条报价），请先清理后再删除`,
       });
     }
-    // 清理：可能是别人创建的 procurement（应一并把 created_by 置 NULL，避免 FK 失败）
+    // 清理：避免 FK 失败（被删账号是别人的创建者时）
     await db
       .update(users)
       .set({ createdBy: null })

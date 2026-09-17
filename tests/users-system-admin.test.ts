@@ -121,14 +121,14 @@ describe('DELETE /admin/users/:id', () => {
     expect(row?.createdBy).toBeNull();
   });
 
-  it('procurement 不可删除任何账号（403）', async () => {
+  it('procurement 可删除自己创建的 supplier（204）', async () => {
     const app = createApp(testDb);
     await insertUser(testDb, { username: 'admin', role: 'admin' });
     const buyer = await insertUser(testDb, { username: 'buyer', role: 'procurement' });
     const target = await insertUser(testDb, { username: 'target', companyName: 'T', createdBy: buyer.user.id });
     const tok = await loginToken(app, 'buyer', 'Passw0rd!123');
     const res = await request(app).delete(`/api/admin/users/${target.user.id}`).set(auth(tok));
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(204);
   });
 
   it('admin 删除另一个 admin（非系统）', async () => {
