@@ -13,6 +13,7 @@ export async function insertUser(
     companyName?: string | null;
     active?: boolean;
     password?: string;
+    createdBy?: string | null;
   },
 ) {
   const password = opts.password ?? 'Passw0rd!123';
@@ -24,6 +25,7 @@ export async function insertUser(
       role: opts.role ?? 'supplier',
       companyName: opts.companyName ?? null,
       active: opts.active ?? true,
+      createdBy: opts.createdBy ?? null,
     })
     .returning();
   // 自动邀请：任何新启用的 supplier 对当前所有开放中/已截止的 tender 都加入邀请（与现状一致）

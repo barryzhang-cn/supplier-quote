@@ -12,6 +12,12 @@ import {
   replaceInvitations,
 } from '../services/invitations';
 import { assertOwnTender } from '../services/admin-guard';
+import {
+  canChangeRole,
+  canCreateRole,
+  canModifyUser,
+  listVisibleUserIds,
+} from '../services/users-permissions';
 import type { Db } from '../db/client';
 
 const createUserSchema = z.object({
@@ -28,6 +34,7 @@ const createUserSchema = z.object({
 const patchUserSchema = z.object({
   password: z.string().min(8, '密码至少 8 位').max(72).optional(),
   active: z.boolean().optional(),
+  role: z.enum(['admin', 'procurement', 'supplier']).optional(),
 });
 
 const tenderBodySchema = z.object({
@@ -44,9 +51,13 @@ const addInvitationSchema = z.object({
 
 export function adminRouter(db: Db) {
   const r = Router();
+  const me = (req: import('express').Request) => currentUser(req);
 
-  // -------- 供应商账号管理（admin + procurement 都可） --------
-  r.get('/users', async (_req, res) => {
+  // -------- 账号管理（admin + procurement，但 procurement 受限） --------
+  r.get('/users', async (req, res) => {
+    const user = me(req);
+    const ids = await listVisibleUserIds(db, { id: user.id, role: user.role });
+    if (ids.length === 0) return res.json({ users: [] });
     const rows = await db
       .select({
         id: users.id,
@@ -54,17 +65,23 @@ export function adminRouter(db: Db) {
         role: users.role,
         companyName: users.companyName,
         active: users.active,
+        createdBy: users.createdBy,
         createdAt: users.createdAt,
       })
       .from(users)
+      .where(sql`${users.id} = ANY(${sql.raw(`ARRAY[${ids.map((i) => `'${i}'`).join(',')}]::uuid[]`)})`)
       .orderBy(users.createdAt);
     res.json({ users: rows });
   });
 
   r.post('/users', async (req, res) => {
+    const actor = me(req);
     const parsed = createUserSchema.safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
     const { username, password, companyName, role } = parsed.data;
+    if (!canCreateRole(actor.role, role)) {
+      return res.status(403).json({ error: '您无权创建该角色的账号' });
+    }
     const [dup] = await db.select({ id: users.id }).from(users).where(eq(users.username, username));
     if (dup) return res.status(409).json({ error: '用户名已存在' });
     const [u] = await db
@@ -74,22 +91,41 @@ export function adminRouter(db: Db) {
         passwordHash: hashPassword(password),
         role,
         companyName: companyName ?? null,
+        createdBy: actor.id,
       })
       .returning({
         id: users.id,
         username: users.username,
-        companyName: users.companyName,
         role: users.role,
+        companyName: users.companyName,
+        active: users.active,
       });
     return res.status(201).json({ user: u });
   });
 
   r.patch('/users/:id', async (req, res) => {
+    const actor = me(req);
     const parsed = patchUserSchema.safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
-    const values: { passwordHash?: string; active?: boolean } = {};
+
+    const [target] = await db
+      .select({ id: users.id, role: users.role, createdBy: users.createdBy })
+      .from(users)
+      .where(eq(users.id, req.params.id));
+    if (!target) return res.status(404).json({ error: '用户不存在' });
+
+    if (!canModifyUser(actor.role, target.role, target.createdBy, actor.id)) {
+      return res.status(403).json({ error: '您无权修改该账号' });
+    }
+
+    if (parsed.data.role !== undefined && !canChangeRole(actor.role, actor.id, target.id)) {
+      return res.status(403).json({ error: '不能修改自己的角色' });
+    }
+
+    const values: { passwordHash?: string; active?: boolean; role?: 'admin' | 'procurement' | 'supplier' } = {};
     if (parsed.data.password) values.passwordHash = hashPassword(parsed.data.password);
     if (parsed.data.active !== undefined) values.active = parsed.data.active;
+    if (parsed.data.role !== undefined) values.role = parsed.data.role;
     if (Object.keys(values).length === 0) return res.status(422).json({ error: '无可更新字段' });
     const [u] = await db
       .update(users)
@@ -101,13 +137,10 @@ export function adminRouter(db: Db) {
         role: users.role,
         active: users.active,
       });
-    if (!u) return res.status(404).json({ error: '用户不存在' });
     return res.json({ user: u });
   });
 
   // -------- 招标管理 --------
-  const me = (req: import('express').Request) => currentUser(req);
-
   r.get('/tenders', async (req, res) => {
     const user = me(req);
     const baseSelect = db
@@ -138,7 +171,6 @@ export function adminRouter(db: Db) {
     const user = me(req);
     const deadline = new Date(parsed.data.deadline);
     if (deadline.getTime() <= Date.now()) return res.status(422).json({ error: '截止时间必须晚于当前时间' });
-    // procurement 创建时 created_by 强制 = me；admin 可选（默认 me，可指定他人）
     let createdBy = user.id;
     if (user.role === 'admin' && parsed.data.createdBy) createdBy = parsed.data.createdBy;
     const [t] = await db
@@ -159,7 +191,7 @@ export function adminRouter(db: Db) {
 
   r.get('/tenders/:id', async (req, res) => {
     const user = me(req);
-    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: '招标不存在' }); }
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
     const rows = await db
       .select({
@@ -184,7 +216,7 @@ export function adminRouter(db: Db) {
 
   r.patch('/tenders/:id', async (req, res) => {
     const user = me(req);
-    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: '招标不存在' }); }
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
     const parsed = tenderBodySchema.partial().safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
@@ -203,7 +235,6 @@ export function adminRouter(db: Db) {
       if (d.getTime() <= Date.now()) return res.status(422).json({ error: '截止时间必须晚于当前时间' });
       values.deadline = d;
     }
-    // 只有 admin 可以修改 created_by（重新指派）；procurement 忽略
     if (user.role === 'admin' && parsed.data.createdBy !== undefined) {
       values.createdBy = parsed.data.createdBy;
     }
@@ -220,7 +251,7 @@ export function adminRouter(db: Db) {
 
   r.post('/tenders/:id/close', async (req, res) => {
     const user = me(req);
-    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: '招标不存在' }); }
     const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
     if (t.status === 'closed') return res.status(409).json({ error: '招标已关闭' });
     const [updated] = await db
@@ -234,7 +265,7 @@ export function adminRouter(db: Db) {
 
   r.post('/tenders/:id/invitations', async (req, res) => {
     const user = me(req);
-    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: '招标不存在' }); }
     const [t] = await db
       .select({ id: tenders.id })
       .from(tenders)
@@ -255,7 +286,7 @@ export function adminRouter(db: Db) {
 
   r.delete('/tenders/:id/invitations/:supplierId', async (req, res) => {
     const user = me(req);
-    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: "招标不存在" }); }
+    try { await assertOwnTender(db, req.params.id, user.id, user.role); } catch { return res.status(404).json({ error: '招标不存在' }); }
     const [t] = await db
       .select({ id: tenders.id })
       .from(tenders)
