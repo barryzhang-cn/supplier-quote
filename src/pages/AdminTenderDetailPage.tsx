@@ -14,7 +14,14 @@ import {
 } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 import { Textarea } from '@/components/ui/textarea';
 
 interface BoardQuote {
@@ -28,14 +35,33 @@ interface BoardQuote {
 }
 
 interface AdminDetail {
-  tender: { id: string; title: string; description: string | null; deadline: string; status: string };
+  tender: {
+    id: string;
+    title: string;
+    description: string | null;
+    deadline: string;
+    status: string;
+    invitedSupplierIds: string[];
+  };
   quotes: BoardQuote[];
+}
+
+interface SupplierRow {
+  id: string;
+  username: string;
+  companyName: string | null;
+  active: boolean;
 }
 
 export default function AdminTenderDetailPage() {
   const { id } = useParams<{ id: string }>();
   const fetcher = useCallback(() => api<AdminDetail>(`/admin/tenders/${id}`), [id]);
   const { data } = usePolling(fetcher);
+
+  const { data: usersData } = usePolling<{ users: SupplierRow[] }>(
+    useCallback(() => api('/admin/users'), []),
+  );
+  const allSuppliers = (usersData?.users ?? []).filter((u) => u.active);
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -44,6 +70,8 @@ export default function AdminTenderDetailPage() {
   const [msg, setMsg] = useState('');
   const [error, setError] = useState('');
   const [initialized, setInitialized] = useState(false);
+  const [invited, setInvited] = useState<Set<string>>(new Set());
+  const [invitedInitialized, setInvitedInitialized] = useState(false);
 
   useEffect(() => {
     if (data && !initialized) {
@@ -52,7 +80,20 @@ export default function AdminTenderDetailPage() {
       setDeadline(data.tender.deadline.slice(0, 16));
       setInitialized(true);
     }
-  }, [data, initialized]);
+    if (data && !invitedInitialized) {
+      setInvited(new Set(data.tender.invitedSupplierIds ?? []));
+      setInvitedInitialized(true);
+    }
+  }, [data, initialized, invitedInitialized]);
+
+  function toggleInvited(sid: string) {
+    setInvited((prev) => {
+      const next = new Set(prev);
+      if (next.has(sid)) next.delete(sid);
+      else next.add(sid);
+      return next;
+    });
+  }
 
   if (!data) return <div className="p-6 text-muted-foreground">加载中…</div>;
   const t = data.tender;
@@ -68,6 +109,7 @@ export default function AdminTenderDetailPage() {
           title,
           description: description || null,
           ...(deadline ? { deadline: new Date(deadline).toISOString() } : {}),
+          invitedSupplierIds: Array.from(invited),
         },
       });
       setMsg('已保存');
@@ -106,6 +148,8 @@ export default function AdminTenderDetailPage() {
               ) : (
                 <Badge>报价中</Badge>
               )}
+              <span>·</span>
+              <span>已邀请 {t.invitedSupplierIds.length} 家供应商</span>
             </div>
           </div>
           <div className="flex gap-2">
@@ -147,6 +191,33 @@ export default function AdminTenderDetailPage() {
                 onChange={(e) => setDeadline(e.target.value)}
               />
             </div>
+            <div className="space-y-1.5">
+              <Label>邀请供应商（{invited.size} / {allSuppliers.length}）</Label>
+              {allSuppliers.length === 0 ? (
+                <p className="text-xs text-muted-foreground">暂无启用的供应商账号</p>
+              ) : (
+                <div className="space-y-1 rounded-md border border-input p-3 max-h-60 overflow-auto">
+                  {allSuppliers.map((s) => (
+                    <label
+                      key={s.id}
+                      className="flex items-center gap-2 text-sm cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="rounded"
+                        checked={invited.has(s.id)}
+                        onChange={() => toggleInvited(s.id)}
+                      />
+                      <span className="font-medium">{s.companyName ?? s.username}</span>
+                      <span className="text-xs text-muted-foreground">@{s.username}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground">
+                保存时将整体替换邀请名单（已勾选=邀请；未勾选=取消）
+              </p>
+            </div>
             <div className="flex gap-2">
               <Button size="sm" onClick={saveEdit}>
                 保存
@@ -174,7 +245,7 @@ export default function AdminTenderDetailPage() {
         <CardHeader>
           <CardTitle>报价榜</CardTitle>
           <CardDescription>
-            共 {data.quotes.length} 家参与 · 每家仅显示最新报价 · 同价先提交者优先
+            共 {data.quotes.length} 家参与 · 含历史报价 · 同价先提交者优先
           </CardDescription>
         </CardHeader>
         <CardContent>
