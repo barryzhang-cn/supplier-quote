@@ -6,6 +6,16 @@
 
 ### 待定
 
+## [0.3.0] - 2026-09-17
+
+### 新增
+
+- 账号管理权限分级：procurement 不能创建超级管理员；列表按 `created_by` 过滤；禁止自改 role
+- `users.created_by` 字段 + drizzle 迁移 0003
+- 服务层 `users-permissions.ts`：`canCreateRole / canModifyUser / canChangeRole / listVisibleUserIds`
+- 前端 AdminUsersPage 按角色显示可用 role + 隐藏对内部账号的修改按钮
+- 新增 14 个测试覆盖以上规则
+
 ## [0.2.0] - 2026-09-17
 
 ### 新增
