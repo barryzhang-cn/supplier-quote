@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import { and, desc, eq } from 'drizzle-orm';
 import { z } from 'zod';
-import { tenders, quotes } from '../db/schema';
+import { tenders, quotes, tenderInvitations } from '../db/schema';
 import { currentUser } from '../auth/middleware';
 import { computeRanks } from '../services/ranking';
 import { upsertQuote } from '../services/quotes';
+import { isInvited } from '../services/invitations';
 import type { Db } from '../db/client';
 
 const quoteBodySchema = z.object({
@@ -31,6 +32,13 @@ export function supplierRouter(db: Db) {
         myQuoteUpdatedAt: quotes.updatedAt,
       })
       .from(tenders)
+      .innerJoin(
+        tenderInvitations,
+        and(
+          eq(tenderInvitations.tenderId, tenders.id),
+          eq(tenderInvitations.supplierId, me.id),
+        ),
+      )
       .leftJoin(quotes, and(eq(quotes.tenderId, tenders.id), eq(quotes.supplierId, me.id)))
       .orderBy(desc(tenders.createdAt));
     const allQuotes = await db
@@ -59,27 +67,41 @@ export function supplierRouter(db: Db) {
 
   r.get('/tenders/:id', async (req, res) => {
     const me = currentUser(req);
-    const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
+    const [t] = await db
+      .select()
+      .from(tenders)
+      .innerJoin(
+        tenderInvitations,
+        and(
+          eq(tenderInvitations.tenderId, tenders.id),
+          eq(tenderInvitations.supplierId, me.id),
+        ),
+      )
+      .where(eq(tenders.id, req.params.id));
     if (!t) return res.status(404).json({ error: '招标不存在' });
+    const tender = t.tenders;
     const [myQuote] = await db
       .select()
       .from(quotes)
-      .where(and(eq(quotes.tenderId, t.id), eq(quotes.supplierId, me.id)));
+      .where(and(eq(quotes.tenderId, tender.id), eq(quotes.supplierId, me.id)));
     const peers = await db
       .select({ supplierId: quotes.supplierId, amount: quotes.amount, createdAt: quotes.createdAt })
       .from(quotes)
-      .where(eq(quotes.tenderId, t.id));
+      .where(eq(quotes.tenderId, tender.id));
     const ranks = computeRanks(peers);
     res.json({
-      tender: t,
+      tender: tender,
       myQuote: myQuote ? { ...myQuote, rank: ranks.get(me.id) ?? null } : null,
       totalParticipants: peers.length,
-      effectiveClosed: t.status === 'closed' || t.deadline.getTime() <= Date.now(),
+      effectiveClosed: tender.status === 'closed' || tender.deadline.getTime() <= Date.now(),
     });
   });
 
   r.get('/tenders/:id/quote', async (req, res) => {
     const me = currentUser(req);
+    if (!(await isInvited(db, req.params.id, me.id))) {
+      return res.status(404).json({ error: '招标不存在' });
+    }
     const [q] = await db
       .select()
       .from(quotes)
@@ -89,6 +111,9 @@ export function supplierRouter(db: Db) {
 
   r.put('/tenders/:id/quote', async (req, res) => {
     const me = currentUser(req);
+    if (!(await isInvited(db, req.params.id, me.id))) {
+      return res.status(403).json({ error: '您未受邀参与此招标' });
+    }
     const parsed = quoteBodySchema.safeParse(req.body);
     if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
     const result = await upsertQuote(db, req.params.id, me.id, parsed.data.amount, parsed.data.note ?? null);
@@ -98,12 +123,22 @@ export function supplierRouter(db: Db) {
 
   r.get('/tenders/:id/ranking', async (req, res) => {
     const me = currentUser(req);
-    const [t] = await db.select({ id: tenders.id }).from(tenders).where(eq(tenders.id, req.params.id));
+    const [t] = await db
+      .select({ id: tenders.id })
+      .from(tenders)
+      .innerJoin(
+        tenderInvitations,
+        and(
+          eq(tenderInvitations.tenderId, tenders.id),
+          eq(tenderInvitations.supplierId, me.id),
+        ),
+      )
+      .where(eq(tenders.id, req.params.id));
     if (!t) return res.status(404).json({ error: '招标不存在' });
     const peers = await db
       .select({ supplierId: quotes.supplierId, amount: quotes.amount, createdAt: quotes.createdAt })
       .from(quotes)
-      .where(eq(quotes.tenderId, t.id));
+      .where(eq(quotes.tenderId, t.tenders.id));
     const ranks = computeRanks(peers);
     const myRank = ranks.get(me.id) ?? null;
     return res.json({ rank: myRank, total: peers.length });
