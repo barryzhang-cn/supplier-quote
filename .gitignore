@@ -2,3 +2,7 @@ node_modules/
 dist/
 .env
 *.log
+*.local
+.env.*.local
+*.tsbuildinfo
+.DS_Store
