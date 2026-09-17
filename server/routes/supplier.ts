@@ -1,9 +1,18 @@
 import { Router } from 'express';
 import { and, desc, eq } from 'drizzle-orm';
+import { z } from 'zod';
 import { tenders, quotes } from '../db/schema';
 import { currentUser } from '../auth/middleware';
 import { computeRanks } from '../services/ranking';
+import { upsertQuote } from '../services/quotes';
 import type { Db } from '../db/client';
+
+const quoteBodySchema = z.object({
+  amount: z
+    .string()
+    .regex(/^\d{1,12}(\.\d{1,2})?$/, '金额必须是非负数字，最多两位小数'),
+  note: z.string().max(2000).nullish(),
+});
 
 export function supplierRouter(db: Db) {
   const r = Router();
@@ -67,6 +76,24 @@ export function supplierRouter(db: Db) {
       totalParticipants: peers.length,
       effectiveClosed: t.status === 'closed' || t.deadline.getTime() <= Date.now(),
     });
+  });
+
+  r.get('/tenders/:id/quote', async (req, res) => {
+    const me = currentUser(req);
+    const [q] = await db
+      .select()
+      .from(quotes)
+      .where(and(eq(quotes.tenderId, req.params.id), eq(quotes.supplierId, me.id)));
+    res.json({ quote: q ?? null });
+  });
+
+  r.put('/tenders/:id/quote', async (req, res) => {
+    const me = currentUser(req);
+    const parsed = quoteBodySchema.safeParse(req.body);
+    if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
+    const result = await upsertQuote(db, req.params.id, me.id, parsed.data.amount, parsed.data.note ?? null);
+    if (!result.ok) return res.status(result.code).json({ error: result.error });
+    return res.json({ created: result.created });
   });
 
   return r;
