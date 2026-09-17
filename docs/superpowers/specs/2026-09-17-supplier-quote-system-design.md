@@ -84,12 +84,30 @@
 
 约束：`UNIQUE(tender_id, supplier_id)` — 每供应商每招标一条记录，重复报价为原地更新（满足"可多次修改，以最新一次保存为准"）。
 
+### tender_invitations（招标邀请名单，2026-09-17 增量需求）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| tender_id | uuid FK → tenders.id ON DELETE CASCADE | |
+| supplier_id | uuid FK → users.id ON DELETE CASCADE | |
+| invited_at | timestamptz DEFAULT now() | |
+
+约束：`UNIQUE(tender_id, supplier_id)`。外键 ON DELETE CASCADE：招标/账号删除时邀请自动清。
+
+### 数据迁移（一次性 backfill）
+
+在新增 `tender_invitations` 表后，对**已有**的每个开放中或历史招标插入"当前全部供应商角色用户"作为邀请 —— 保证现有招标在切换前后可见性不变（已可见的继续可见）。后续新增招标按新规则执行。
+
 ## 4. 核心规则
 
 1. **名次规则**：`ROW_NUMBER() OVER (ORDER BY amount ASC, created_at ASC)`。金额低者靠前；金额相同，首次提交时间早者靠前。修改报价**不刷新**首次提交时间（防止后改者插队，同时奖励尽早提交）。
 2. **截止锁定**：报价的 INSERT/UPDATE 语句带守卫条件 `WHERE tender 状态 open AND deadline > now()`（数据库级守卫，即使绕过前端也无法在截止后写入）。返回 409 表明已截止/已关闭。
-3. **数据隔离**：全部在服务端强制。供应商的所有查询固定 `supplier_id = 当前用户`；名次接口仅返回 `{rank, totalParticipants}`，**不暴露其他供应商的报价金额与公司名**。
-4. **实时名次**：供应商名次卡片、管理员报价榜均 5 秒轮询。
+3. **数据隔离（双层）**：
+   - **报价隔离**：供应商的所有报价查询固定 `supplier_id = 当前用户`；名次接口仅返回 `{rank, totalParticipants}`，**不暴露其他供应商的报价金额与公司名**。
+   - **邀请隔离（2026-09-17 新增）**：未在 `tender_invitations` 中的供应商对该招标**完全不可见**：`GET /api/tenders` 列表中不出现；`GET /api/tenders/:id` 返回 404；`PUT /api/tenders/:id/quote` 返回 403「您未受邀参与此招标」。管理员永远绕过此隔离。
+4. **邀请名单可变性（2026-09-17 新增）**：招标发布后任何时刻可增删（即便已有报价）。被移除的供应商立即看不到招标、不能再报价；但其**历史报价在管理员账面上保留**。创建/编辑时可批量调整（`invitedSupplierIds` 字段，幂等）；运行期可走单条邀请管理接口（见 API 表）。
+5. **邀请默认值（2026-09-17 新增）**：创建/编辑招标时，`invitedSupplierIds` 不传或传空数组 = **不邀请任何人**（刻意收紧默认）。
+6. **实时名次**：供应商名次卡片、管理员报价榜均 5 秒轮询。
 
 ## 5. API 设计
 
@@ -108,9 +126,11 @@
 |---|---|---|
 | GET/POST | /admin/users | 列表 / 新建供应商账号（管理员设置初始密码） |
 | PATCH | /admin/users/:id | 重置密码 / 停用启用 |
-| GET/POST | /admin/tenders | 招标列表（含报价数统计）/ 新建招标 |
-| GET/PATCH | /admin/tenders/:id | 详情（含全部报价+名次）/ 编辑（截止前） |
+| GET/POST | /admin/tenders | 招标列表（含报价数统计）/ 新建招标；POST 可选 body `invitedSupplierIds: string[]`（2026-09-17 新增） |
+| GET/PATCH | /admin/tenders/:id | 详情（含全部报价+名次+邀请名单 `invitedSupplierIds`）/ 编辑；PATCH 可选 body `invitedSupplierIds: string[]`（2026-09-17 新增） |
 | POST | /admin/tenders/:id/close | 提前关闭 |
+| POST | /admin/tenders/:id/invitations | 增补单个邀请 `{supplierId}`；用于运行期调整（2026-09-17 新增） |
+| DELETE | /admin/tenders/:id/invitations/:supplierId | 取消单个邀请；该供应商历史报价保留（2026-09-17 新增） |
 
 ### 供应商（role=supplier）
 
@@ -129,8 +149,8 @@
 |---|---|---|
 | /login | 公开 | 登录表单，按角色跳转 |
 | /admin | admin | 招标列表：标题、截止时间、状态、报价数（紧凑表格） |
-| /admin/tenders/new | admin | 新建招标表单 |
-| /admin/tenders/:id | admin | 招标详情 + 全部报价榜（名次、公司、金额、首次提交、最近更新）+ 编辑 + 提前关闭 |
+| /admin/tenders/new | admin | 新建招标表单（含"邀请供应商"多选区，2026-09-17 新增） |
+| /admin/tenders/:id | admin | 招标详情 + 全部报价榜（名次、公司、金额、首次提交、最近更新）+ 编辑（含邀请名单调整）+ 提前关闭 + 单条邀请增删（2026-09-17 新增） |
 | /admin/users | admin | 供应商账号管理：列表、新建、重置密码、停用 |
 | / | supplier | 招标列表（开放中 + 已截止，状态标记），显示我的报价状态/金额/名次徽章 |
 | /tenders/:id | supplier | 招标详情 + 报价表单（金额、备注；截止前可反复修改，截止后只读并提示）+ 我的名次卡片（第 N 名 / 共 M 家，5s 轮询；截止后仍可查看最终名次） |
@@ -179,3 +199,11 @@ CREATE DATABASE supplier_quote OWNER supplier_quote;
 - 多币种、含税/未税切换、折扣明细
 - 供应商自助注册（账号一律管理员创建）
 - 公网暴露与 HTTPS（接入方式确定后再加）
+
+## 10. 决策记录（增量需求：2026-09-17 邀请名单）
+
+| 决策 | 选项 → 选定 | 理由 |
+|---|---|---|
+| 邀请机制严格度 | 软 / 仅标记 / **硬邀请** | 用户明确要求"未邀请者看不到招标"，符合需求文档"受邀参与报价"的语义 |
+| 名单可变性 | 冻结 / **可随时调整** | 现实场景常需补充邀请遗漏的供应商；移除时报价保留避免破坏审计 |
+| 不勾默认值 | 全量默认 / **不勾则不邀请** | 用户刻意选择收紧默认，强制管理员显式选择 |

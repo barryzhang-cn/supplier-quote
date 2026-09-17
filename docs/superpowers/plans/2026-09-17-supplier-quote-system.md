@@ -3908,3 +3908,944 @@ git commit -m "chore: 部署配置收尾" --allow-empty
 2. **占位符扫描**：无 TBD/TODO；所有步骤含完整代码或精确命令。
 3. **类型一致性**：`Db` 类型贯穿（client.ts 定义，路由工厂参数）；`computeRanks` 签名在 Task 9 定义、Task 10/12 复用一致；`usePolling` 返回 `{data, error, reload}`（Task 14 定义，Task 16/17 使用一致）；金额全程字符串（`numeric` → string，zod regex 校验）规避浮点。
 4. **已知执行顺序约束**：Task 14 的 Step 3-5 依赖 Task 15 的 UI 组件——执行时若按序进行，Task 14 先提交 Step 1-2（含占位页），Task 15 完成后再补登录页并验证。
+
+---
+
+# PATCH: 邀请名单（2026-09-17 增量）
+
+新增 5 个任务（Task 20-24）覆盖"按供应商邀请"的完整实现。每任务 ≤ 1 文件修改、≤ 1 测试文件。原则：原 Task 6-19 的所有内容不动；只在前后端相关路由/页面打补丁。
+
+## Task 20: tender_invitations Schema + 迁移 + 数据 backfill
+
+**Files:**
+- Modify: `server/db/schema.ts`（追加 tender_invitations 表）
+- Modify: `server/db/migrate.ts`（已经是 noop，自动跑 drizzle 即可）
+- Create: `drizzle/0001_*.sql`（drizzle-kit generate 生成）
+
+**Step 1: 追加 schema**
+
+在 `server/db/schema.ts` 末尾追加：
+
+```ts
+export const tenderInvitations = pgTable(
+  'tender_invitations',
+  {
+    tenderId: uuid('tender_id')
+      .notNull()
+      .references(() => tenders.id, { onDelete: 'cascade' }),
+    supplierId: uuid('supplier_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    invitedAt: timestamp('invited_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('tender_invitations_tender_supplier_uq').on(t.tenderId, t.supplierId),
+    index('tender_invitations_supplier_idx').on(t.supplierId, t.tenderId),
+  ],
+);
+```
+
+**Step 2: 生成迁移**
+
+Run: `npm run db:generate`
+Expected: `drizzle/0001_*.sql` 生成（含 CREATE TABLE + 2 个索引）
+
+**Step 3: 类型检查 + 应用迁移**
+
+Run: `npm run typecheck` → 无错误
+Run: `npm run db:migrate` → 输出 "migrations applied"
+
+**Step 4: 数据 backfill（一次性，1Panel postgres 库 supplier_quote）**
+
+```sql
+INSERT INTO tender_invitations (tender_id, supplier_id)
+SELECT t.id, u.id
+FROM tenders t
+CROSS JOIN users u
+WHERE u.role = 'supplier' AND u.active = true
+ON CONFLICT (tender_id, supplier_id) DO NOTHING;
+```
+
+跑法（用 supplier_quote 角色密码）：
+```bash
+docker exec 1Panel-postgresql-NSJt psql -U supplier_quote -d supplier_quote \
+  -c "INSERT INTO tender_invitations (tender_id, supplier_id) SELECT t.id, u.id FROM tenders t CROSS JOIN users u WHERE u.role = 'supplier' AND u.active = true ON CONFLICT (tender_id, supplier_id) DO NOTHING;"
+```
+
+Expected: `INSERT 0 N`（N = 已有招标数 × 已有供应商数）。
+
+**Step 5: 验证**
+
+```bash
+docker exec 1Panel-postgresql-NSJt psql -U user_crcW5z -d supplier_quote \
+  -c "SELECT count(*) FROM tender_invitations;"
+```
+Expected: 大于 0。
+
+**Step 6: Commit**
+
+```bash
+git add server/db/schema.ts drizzle/
+git commit -m "feat: tender_invitations 表 + 迁移 + 已有数据 backfill"
+```
+
+## Task 21: 邀请服务（含单元测试，TDD）
+
+**Files:**
+- Create: `server/services/invitations.ts`
+- Create: `tests/invitations.test.ts`
+
+**Step 1: 写失败测试** `tests/invitations.test.ts`
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest';
+import { eq, and } from 'drizzle-orm';
+import { testDb, rawClient } from './setup';
+import { tenders, users, tenderInvitations } from '../server/db/schema';
+import {
+  replaceInvitations,
+  addInvitation,
+  removeInvitation,
+  isInvited,
+  listInvitedSupplierIds,
+} from '../server/services/invitations';
+
+async function seed() {
+  await rawClient`TRUNCATE tender_invitations, quotes, tenders, users CASCADE`;
+  const admin = await testDb
+    .insert(users)
+    .values({
+      username: 'boss',
+      passwordHash: 'x',
+      role: 'admin',
+    })
+    .returning();
+  const supA = await testDb
+    .insert(users)
+    .values({ username: 'a', passwordHash: 'x', role: 'supplier', companyName: '甲' })
+    .returning();
+  const supB = await testDb
+    .insert(users)
+    .values({ username: 'b', passwordHash: 'x', role: 'supplier', companyName: '乙' })
+    .returning();
+  const tender = await testDb
+    .insert(tenders)
+    .values({ title: 'T1', deadline: new Date(Date.now() + 86400_000), createdBy: admin[0].id })
+    .returning();
+  return { admin: admin[0], supA: supA[0], supB: supB[0], tender: tender[0] };
+}
+
+describe('invitations service', () => {
+  it('replaceInvitations 幂等替换（增删）', async () => {
+    const { tender, supA, supB } = await seed();
+    await replaceInvitations(testDb, tender.id, [supA.id]);
+    expect(await listInvitedSupplierIds(testDb, tender.id)).toEqual([supA.id]);
+    await replaceInvitations(testDb, tender.id, [supB.id]);
+    expect(await listInvitedSupplierIds(testDb, tender.id)).toEqual([supB.id]);
+  });
+
+  it('replaceInvitations 传空数组 = 不邀请任何人', async () => {
+    const { tender, supA } = await seed();
+    await replaceInvitations(testDb, tender.id, [supA.id]);
+    await replaceInvitations(testDb, tender.id, []);
+    expect(await isInvited(testDb, tender.id, supA.id)).toBe(false);
+  });
+
+  it('replaceInvitations 跳过 admin 与不存在 id（仅保留真供应商）', async () => {
+    const { tender, supA, admin } = await seed();
+    await replaceInvitations(testDb, tender.id, [supA.id, admin.id, '00000000-0000-0000-0000-000000000000']);
+    expect(await isInvited(testDb, tender.id, supA.id)).toBe(true);
+    expect(await isInvited(testDb, tender.id, admin.id)).toBe(false);
+  });
+
+  it('addInvitation / removeInvitation 单条操作', async () => {
+    const { tender, supA, supB } = await seed();
+    await addInvitation(testDb, tender.id, supA.id);
+    await addInvitation(testDb, tender.id, supB.id);
+    expect(await listInvitedSupplierIds(testDb, tender.id)).toEqual(expect.arrayContaining([supA.id, supB.id]));
+    await removeInvitation(testDb, tender.id, supA.id);
+    expect(await isInvited(testDb, tender.id, supA.id)).toBe(false);
+    expect(await isInvited(testDb, tender.id, supB.id)).toBe(true);
+  });
+
+  it('addInvitation 重复添加不报错（UNIQUE 约束）', async () => {
+    const { tender, supA } = await seed();
+    await addInvitation(testDb, tender.id, supA.id);
+    await addInvitation(testDb, tender.id, supA.id);
+    const rows = await testDb.select().from(tenderInvitations).where(eq(tenderInvitations.tenderId, tender.id));
+    expect(rows).toHaveLength(1);
+  });
+});
+```
+
+**Step 2: 运行确认失败**
+
+Run: `npx vitest run tests/invitations.test.ts`
+Expected: FAIL — 模块不存在
+
+**Step 3: 实现** `server/services/invitations.ts`
+
+```ts
+import { eq, and, inArray } from 'drizzle-orm';
+import { users, tenderInvitations } from '../db/schema';
+import type { Db } from '../db/client';
+
+/**
+ * 幂等替换某招标的全部邀请：
+ * - 清空现有邀请
+ * - 插入新名单（仅 role=supplier 且 active=true 且真实存在的用户）
+ * - 空数组 = 全部移除
+ */
+export async function replaceInvitations(db: Db, tenderId: string, supplierIds: string[]) {
+  await db.transaction(async (tx) => {
+    await tx.delete(tenderInvitations).where(eq(tenderInvitations.tenderId, tenderId));
+    if (supplierIds.length === 0) return;
+    const valid = await tx
+      .select({ id: users.id })
+      .from(users)
+      .where(and(inArray(users.id, supplierIds), eq(users.role, 'supplier'), eq(users.active, true)));
+    if (valid.length === 0) return;
+    await tx.insert(tenderInvitations).values(
+      valid.map((v) => ({ tenderId, supplierId: v.id })),
+    );
+  });
+}
+
+export async function addInvitation(db: Db, tenderId: string, supplierId: string) {
+  const [u] = await db
+    .select({ id: users.id, role: users.role, active: users.active })
+    .from(users)
+    .where(eq(users.id, supplierId));
+  if (!u || u.role !== 'supplier' || !u.active) {
+    throw Object.assign(new Error('用户不是有效供应商'), { code: 422 });
+  }
+  await db
+    .insert(tenderInvitations)
+    .values({ tenderId, supplierId })
+    .onConflictDoNothing();
+}
+
+export async function removeInvitation(db: Db, tenderId: string, supplierId: string) {
+  await db
+    .delete(tenderInvitations)
+    .where(and(eq(tenderInvitations.tenderId, tenderId), eq(tenderInvitations.supplierId, supplierId)));
+}
+
+export async function isInvited(db: Db, tenderId: string, supplierId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ x: tenderInvitations.tenderId })
+    .from(tenderInvitations)
+    .where(and(eq(tenderInvitations.tenderId, tenderId), eq(tenderInvitations.supplierId, supplierId)));
+  return !!row;
+}
+
+export async function listInvitedSupplierIds(db: Db, tenderId: string): Promise<string[]> {
+  const rows = await db
+    .select({ id: tenderInvitations.supplierId })
+    .from(tenderInvitations)
+    .where(eq(tenderInvitations.tenderId, tenderId));
+  return rows.map((r) => r.id);
+}
+```
+
+**Step 4: 运行确认通过**
+
+Run: `npx vitest run tests/invitations.test.ts`
+Expected: 5 passed
+
+Run: `npm test`（回归）
+Expected: 全过
+
+**Step 5: Commit**
+
+```bash
+git add server/services/invitations.ts tests/invitations.test.ts
+git commit -m "feat: 邀请服务（replace/add/remove/isInvited/list）"
+```
+
+## Task 22: 管理员邀请管理路由（TDD）
+
+**Files:**
+- Modify: `server/routes/admin.ts`（追加 `invitedSupplierIds` 字段处理 + 3 个新路由）
+- Create: `tests/admin-invitations.test.ts`
+
+**Step 1: 写失败测试** `tests/admin-invitations.test.ts`
+
+```ts
+import { describe, it, expect } from 'vitest';
+import request from 'supertest';
+import { createApp } from '../server/app';
+import { testDb } from './setup';
+import { insertUser, loginToken, auth } from './helpers';
+
+async function admin() {
+  const app = createApp(testDb);
+  await insertUser(testDb, { username: 'boss', role: 'admin' });
+  const token = await loginToken(app, 'boss', 'Passw0rd!123');
+  return { app, token };
+}
+
+describe('管理员-邀请管理', () => {
+  it('POST /admin/tenders 时不传 invitedSupplierIds = 不邀请任何人', async () => {
+    const { app, token } = await admin();
+    const sup = await insertUser(testDb, { username: 'sup_a', companyName: '甲' });
+    const res = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({ title: 'T', deadline: new Date(Date.now() + 86400_000).toISOString() });
+    expect(res.status).toBe(201);
+    const detail = await request(app).get(`/api/admin/tenders/${res.body.tender.id}`).set(auth(token));
+    expect(detail.body.tender.invitedSupplierIds).toEqual([]);
+  });
+
+  it('POST /admin/tenders 传 invitedSupplierIds 仅保留真供应商', async () => {
+    const { app, token } = await admin();
+    const sup = await insertUser(testDb, { username: 'sup_a', companyName: '甲' });
+    const res = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({
+        title: 'T',
+        deadline: new Date(Date.now() + 86400_000).toISOString(),
+        invitedSupplierIds: [sup.user.id, '00000000-0000-0000-0000-000000000000'],
+      });
+    expect(res.status).toBe(201);
+    const detail = await request(app).get(`/api/admin/tenders/${res.body.tender.id}`).set(auth(token));
+    expect(detail.body.tender.invitedSupplierIds).toEqual([sup.user.id]);
+  });
+
+  it('PATCH /admin/tenders/:id 替换邀请名单', async () => {
+    const { app, token } = await admin();
+    const supA = await insertUser(testDb, { username: 'sup_a', companyName: '甲' });
+    const supB = await insertUser(testDb, { username: 'sup_b', companyName: '乙' });
+    const create = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({
+        title: 'T',
+        deadline: new Date(Date.now() + 86400_000).toISOString(),
+        invitedSupplierIds: [supA.user.id],
+      });
+    const tid = create.body.tender.id;
+    const patch = await request(app)
+      .patch(`/api/admin/tenders/${tid}`)
+      .set(auth(token))
+      .send({ invitedSupplierIds: [supB.user.id] });
+    expect(patch.status).toBe(200);
+    const detail = await request(app).get(`/api/admin/tenders/${tid}`).set(auth(token));
+    expect(detail.body.tender.invitedSupplierIds).toEqual([supB.user.id]);
+  });
+
+  it('POST /admin/tenders/:id/invitations 单条增补', async () => {
+    const { app, token } = await admin();
+    const supA = await insertUser(testDb, { username: 'sup_a', companyName: '甲' });
+    const supB = await insertUser(testDb, { username: 'sup_b', companyName: '乙' });
+    const create = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({
+        title: 'T',
+        deadline: new Date(Date.now() + 86400_000).toISOString(),
+        invitedSupplierIds: [supA.user.id],
+      });
+    const tid = create.body.tender.id;
+    const add = await request(app)
+      .post(`/api/admin/tenders/${tid}/invitations`)
+      .set(auth(token))
+      .send({ supplierId: supB.user.id });
+    expect(add.status).toBe(201);
+    const detail = await request(app).get(`/api/admin/tenders/${tid}`).set(auth(token));
+    expect(detail.body.tender.invitedSupplierIds.sort()).toEqual([supA.user.id, supB.user.id].sort());
+  });
+
+  it('POST /admin/tenders/:id/invitations 对非供应商返回 422', async () => {
+    const { app, token } = await admin();
+    const boss2 = await insertUser(testDb, { username: 'boss2', role: 'admin' });
+    const create = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({ title: 'T', deadline: new Date(Date.now() + 86400_000).toISOString() });
+    const tid = create.body.tender.id;
+    const add = await request(app)
+      .post(`/api/admin/tenders/${tid}/invitations`)
+      .set(auth(token))
+      .send({ supplierId: boss2.user.id });
+    expect(add.status).toBe(422);
+  });
+
+  it('DELETE /admin/tenders/:id/invitations/:supplierId 取消单个邀请', async () => {
+    const { app, token } = await admin();
+    const supA = await insertUser(testDb, { username: 'sup_a', companyName: '甲' });
+    const create = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({
+        title: 'T',
+        deadline: new Date(Date.now() + 86400_000).toISOString(),
+        invitedSupplierIds: [supA.user.id],
+      });
+    const tid = create.body.tender.id;
+    const del = await request(app)
+      .delete(`/api/admin/tenders/${tid}/invitations/${supA.user.id}`)
+      .set(auth(token));
+    expect(del.status).toBe(204);
+    const detail = await request(app).get(`/api/admin/tenders/${tid}`).set(auth(token));
+    expect(detail.body.tender.invitedSupplierIds).toEqual([]);
+  });
+
+  it('已发布的招标，管理员仍能编辑邀请名单（不受截止限制）', async () => {
+    const { app, token } = await admin();
+    const supA = await insertUser(testDb, { username: 'sup_a', companyName: '甲' });
+    const supB = await insertUser(testDb, { username: 'sup_b', companyName: '乙' });
+    const create = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(token))
+      .send({
+        title: 'T',
+        deadline: new Date(Date.now() - 1000).toISOString(), // 已截止
+        invitedSupplierIds: [supA.user.id],
+      });
+    const tid = create.body.tender.id;
+    const add = await request(app)
+      .post(`/api/admin/tenders/${tid}/invitations`)
+      .set(auth(token))
+      .send({ supplierId: supB.user.id });
+    expect(add.status).toBe(201); // 即使招标已截止，邀请管理仍可用
+  });
+});
+```
+
+**Step 2: 运行确认失败**
+
+Run: `npx vitest run tests/admin-invitations.test.ts`
+Expected: FAIL — invitedSupplierIds 字段未支持；新路由 404
+
+**Step 3: 实现**（修改 `server/routes/admin.ts`）
+
+a) `tenderBodySchema` 追加 `invitedSupplierIds: z.array(z.string().uuid()).optional()` —— 这是公共结构，POST/PATCH 共用。但 PATCH 用 `.partial()` 时这条已经是可选的，无需额外处理。
+
+b) 修改 `POST /admin/tenders`：插入 tender 成功后，若有 `invitedSupplierIds` 调用 `replaceInvitations(db, t.id, ...)`.
+
+d) 修改 `GET /admin/tenders/:id`：在返回前追加 `invitedSupplierIds: await listInvitedSupplierIds(db, t.id)`。
+
+e) 修改 `PATCH /admin/tenders/:id`：`if (parsed.data.invitedSupplierIds !== undefined)` → 调用 `replaceInvitations`。注意 PATCH 的 409 锁定检查仍保留（编辑标题等仍受截止限制），但邀请调整**绕过** 409（独立路由 POST/DELETE invitations 已经绕过；这里 PATCH 调整如果只传 invitedSupplierIds 也会撞 409——修正：if (只改邀请) skip 409 守卫）。
+
+修正：把 PATCH 守卫改为：只在**尝试改标题/描述/截止时间**时检查锁定；如果 body 只含 `invitedSupplierIds`，跳过锁定检查。
+
+```ts
+r.patch('/tenders/:id', async (req, res) => {
+  const [t] = await db.select().from(tenders).where(eq(tenders.id, req.params.id));
+  if (!t) return res.status(404).json({ error: '招标不存在' });
+  const parsed = tenderBodySchema.partial().safeParse(req.body);
+  if (!parsed.success) return res.status(422).json({ error: parsed.error.issues[0].message });
+  const editingLockRelevant =
+    parsed.data.title !== undefined || parsed.data.description !== undefined || parsed.data.deadline !== undefined;
+  if (editingLockRelevant && (t.status === 'closed' || t.deadline.getTime() <= Date.now())) {
+    return res.status(409).json({ error: '招标已截止或已关闭，不可编辑' });
+  }
+  const values: { title?: string; description?: string | null; deadline?: Date } = {};
+  if (parsed.data.title !== undefined) values.title = parsed.data.title;
+  if (parsed.data.description !== undefined) values.description = parsed.data.description ?? null;
+  if (parsed.data.deadline !== undefined) {
+    const d = new Date(parsed.data.deadline);
+    if (d.getTime() <= Date.now()) return res.status(422).json({ error: '截止时间必须晚于当前时间' });
+    values.deadline = d;
+  }
+  if (Object.keys(values).length > 0) {
+    await db.update(tenders).set(values).where(eq(tenders.id, t.id));
+  }
+  if (parsed.data.invitedSupplierIds !== undefined) {
+    await replaceInvitations(db, t.id, parsed.data.invitedSupplierIds);
+  }
+  const [updated] = await db.select().from(tenders).where(eq(tenders.id, t.id));
+  return res.json({
+    tender: {
+      ...updated,
+      invitedSupplierIds: await listInvitedSupplierIds(db, t.id),
+    },
+  });
+});
+```
+
+f) 追加 2 个新路由（**不**受锁定检查，仅依赖 404）：
+
+```ts
+r.post('/tenders/:id/invitations', async (req, res) => {
+  const [t] = await db.select({ id: tenders.id }).from(tenders).where(eq(tenders.id, req.params.id));
+  if (!t) return res.status(404).json({ error: '招标不存在' });
+  const { supplierId } = z.object({ supplierId: z.string().uuid() }).parse(req.body);
+  try {
+    await addInvitation(db, t.id, supplierId);
+  } catch (e) {
+    if ((e as { code?: number }).code === 422) return res.status(422).json({ error: (e as Error).message });
+    throw e;
+  }
+  return res.status(201).json({ invitedSupplierIds: await listInvitedSupplierIds(db, t.id) });
+});
+
+r.delete('/tenders/:id/invitations/:supplierId', async (req, res) => {
+  const [t] = await db.select({ id: tenders.id }).from(tenders).where(eq(tenders.id, req.params.id));
+  if (!t) return res.status(404).json({ error: '招标不存在' });
+  await removeInvitation(db, t.id, req.params.supplierId);
+  return res.status(204).send();
+});
+```
+
+**Step 4: 运行确认通过**
+
+Run: `npx vitest run tests/admin-invitations.test.ts`
+Expected: 7 passed
+
+Run: `npm test`
+Expected: 全过
+
+**Step 5: Commit**
+
+```bash
+git add server/routes/admin.ts tests/admin-invitations.test.ts
+git commit -m "feat: 管理员邀请管理（POST/PATCH 批量 + 单条增删）"
+```
+
+## Task 23: 供应商接口加邀请守卫（TDD）
+
+**Files:**
+- Modify: `server/routes/supplier.ts`（4 个接口加 `isInvited` 守卫）
+- Create: `tests/supplier-invitations.test.ts`
+
+**Step 1: 写失败测试** `tests/supplier-invitations.test.ts`
+
+```ts
+import { describe, it, expect } from 'vitest';
+import request from 'supertest';
+import { createApp } from '../server/app';
+import { testDb } from './setup';
+import { insertUser, loginToken, auth } from './helpers';
+import { tenders, users, quotes } from '../server/db/schema';
+
+async function setup(invitedSupplierIds: string[] = []) {
+  const app = createApp(testDb);
+  await insertUser(testDb, { username: 'boss', role: 'admin' });
+  const boss = (await testDb.select().from(users)).find(
+    (u: { username: string }) => u.username === 'boss',
+  )!;
+  const supInvited = await insertUser(testDb, { username: 'invited', companyName: '已邀' });
+  const supExcluded = await insertUser(testDb, { username: 'excluded', companyName: '未邀' });
+  const create = await request(app)
+    .post('/api/admin/tenders')
+    .auth(undefined as never, { type: undefined as never } as never); // placeholder
+  // 改用直接 insert + insertUser admin
+  const token = await loginToken(app, 'boss', 'Passw0rd!123');
+  const tenderRes = await request(app)
+    .post('/api/admin/tenders')
+    .set(auth(token))
+    .send({
+      title: 'T',
+      deadline: new Date(Date.now() + 86400_000).toISOString(),
+      invitedSupplierIds,
+    });
+  return {
+    app,
+    supInvited: supInvited.user,
+    supExcluded: supExcluded.user,
+    bossId: boss.id,
+    tenderId: tenderRes.body.tender.id as string,
+  };
+}
+
+describe('供应商-邀请隔离', () => {
+  it('未邀请者看不到该招标（列表中不出现）', async () => {
+    const { app, supInvited, supExcluded, tenderId } = await setup([supInvited.id]);
+    const invTok = await loginToken(app, 'invited', 'Passw0rd!123');
+    const exTok = await loginToken(app, 'excluded', 'Passw0rd!123');
+    const invList = await request(app).get('/api/tenders').set(auth(invTok));
+    const exList = await request(app).get('/api/tenders').set(auth(exTok));
+    expect(invList.body.tenders.find((t: { id: string }) => t.id === tenderId)).toBeDefined();
+    expect(exList.body.tenders.find((t: { id: string }) => t.id === tenderId)).toBeUndefined();
+  });
+
+  it('未邀请者详情返回 404', async () => {
+    const { app, supInvited, supExcluded, tenderId } = await setup([supInvited.id]);
+    const invTok = await loginToken(app, 'invited', 'Passw0rd!123');
+    const exTok = await loginToken(app, 'excluded', 'Passw0rd!123');
+    const invDetail = await request(app).get(`/api/tenders/${tenderId}`).set(auth(invTok));
+    const exDetail = await request(app).get(`/api/tenders/${tenderId}`).set(auth(exTok));
+    expect(invDetail.status).toBe(200);
+    expect(exDetail.status).toBe(404);
+  });
+
+  it('未邀请者 PUT quote 返回 403', async () => {
+    const { app, supInvited, supExcluded, tenderId } = await setup([supInvited.id]);
+    const exTok = await loginToken(app, 'excluded', 'Passw0rd!123');
+    const res = await request(app)
+      .put(`/api/tenders/${tenderId}/quote`)
+      .set(auth(exTok))
+      .send({ amount: '88.88' });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/未受邀/);
+  });
+
+  it('未邀请者 GET ranking 返回 404', async () => {
+    const { app, supInvited, supExcluded, tenderId } = await setup([supInvited.id]);
+    const exTok = await loginToken(app, 'excluded', 'Passw0rd!123');
+    const res = await request(app).get(`/api/tenders/${tenderId}/ranking`).set(auth(exTok));
+    expect(res.status).toBe(404);
+  });
+
+  it('被移除邀请的供应商已有的报价不被删除（仅丧失访问权）', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'boss', role: 'admin' });
+    const boss = (await testDb.select().from(users)).find((u) => u.username === 'boss')!;
+    const sup = await insertUser(testDb, { username: 'sup', companyName: '甲' });
+    const adminToken = await loginToken(app, 'boss', 'Passw0rd!123');
+    const tenderRes = await request(app)
+      .post('/api/admin/tenders')
+      .set(auth(adminToken))
+      .send({
+        title: 'T',
+        deadline: new Date(Date.now() + 86400_000).toISOString(),
+        invitedSupplierIds: [sup.user.id],
+      });
+    const tid = tenderRes.body.tender.id;
+    const supTok = await loginToken(app, 'sup', 'Passw0rd!123');
+    await request(app).put(`/api/tenders/${tid}/quote`).set(auth(supTok)).send({ amount: '88.88' });
+    // 取消邀请
+    await request(app).delete(`/api/admin/tenders/${tid}/invitations/${sup.user.id}`).set(auth(adminToken));
+    // 供应商访问不到自己已存的报价
+    const res = await request(app).get(`/api/tenders/${tid}/quote`).set(auth(supTok));
+    expect(res.status).toBe(404);
+    // 但管理员榜单仍包含这条报价
+    const detail = await request(app).get(`/api/admin/tenders/${tid}`).set(auth(adminToken));
+    expect(detail.body.quotes).toHaveLength(1);
+    expect(detail.body.quotes[0].supplierId).toBe(sup.user.id);
+  });
+});
+```
+
+**Step 2: 运行确认失败**
+
+Run: `npx vitest run tests/supplier-invitations.test.ts`
+Expected: FAIL — 当前无邀请守卫，未邀请者也能看到/报价
+
+**Step 3: 实现**（修改 `server/routes/supplier.ts`）
+
+a) 顶部 import 追加：`import { isInvited } from '../services/invitations'`
+
+b) 在每个供应商接口处理函数开头加守卫：
+
+```ts
+// 通用守卫辅助
+async function requireInvited(db: Db, tenderId: string, supplierId: string, res: express.Response) {
+  const invited = await isInvited(db, tenderId, supplierId);
+  if (!invited) {
+    res.status(404).json({ error: '招标不存在' });
+    return false;
+  }
+  return true;
+}
+```
+
+实际更直接：在每个路由里就地调用。`PUT /tenders/:id/quote` 用 403 而不是 404（更精确：用户知道招标存在，只是没权限）：
+
+```ts
+r.get('/tenders', async (req, res) => {
+  const me = currentUser(req);
+  const rows = await db.select({...}).from(tenders).leftJoin(quotes, ...).innerJoin(tenderInvitations, and(eq(tenderInvitations.tenderId, tenders.id), eq(tenderInvitations.supplierId, me.id))).where(eq(tenderInvitations.supplierId, me.id)).orderBy(desc(tenders.createdAt));
+  // 后续逻辑不变
+});
+```
+
+即给现有 supplier `/tenders` 列表查询加一个 inner join 到 `tenderInvitations` 限制 me.id。
+
+`GET /tenders/:id`：
+```ts
+const me = currentUser(req);
+const [t] = await db
+  .select()
+  .from(tenders)
+  .innerJoin(tenderInvitations, eq(tenderInvitations.tenderId, tenders.id))
+  .where(and(eq(tenders.id, req.params.id), eq(tenderInvitations.supplierId, me.id)));
+if (!t) return res.status(404).json({ error: '招标不存在' });
+```
+
+`GET /tenders/:id/quote` 和 `PUT /tenders/:id/quote`：同 `/:id` 检查；但 PUT 用 403 更合适——已邀请者知道招标存在，被拒绝是「不能报价」语义。
+
+```ts
+r.put('/tenders/:id/quote', async (req, res) => {
+  const me = currentUser(req);
+  // 先单独验证邀请（而非 join，因为 upsertQuote 内部再 select tender）
+  if (!(await isInvited(db, req.params.id, me.id))) {
+    return res.status(403).json({ error: '您未受邀参与此招标' });
+  }
+  const parsed = quoteBodySchema.safeParse(req.body);
+  // ... 后续不变
+});
+```
+
+`GET /tenders/:id/ranking`：同 `:id` 守卫 404。
+
+**Step 4: 运行确认通过**
+
+Run: `npx vitest run tests/supplier-invitations.test.ts`
+Expected: 5 passed
+
+Run: `npm test`
+Expected: 全过（含既有 7 个 admin invitations 测试 + 11 个 supplier tenders/ranking/quote-upsert 测试 + 1 个新加的「保留报价」用例）
+
+**Step 5: Commit**
+
+```bash
+git add server/routes/supplier.ts tests/supplier-invitations.test.ts
+git commit -m "feat: 供应商接口加邀请隔离守卫（GET 列表/详情/名次 + PUT 报价）"
+```
+
+## Task 24: 前端邀请多选区 + 重建 + 端到端冒烟
+
+**Files:**
+- Modify: `src/pages/AdminTenderNewPage.tsx`
+- Modify: `src/pages/AdminTenderDetailPage.tsx`
+- Modify: `src/pages/AdminUsersPage.tsx`（顺手：在账号列表显示公司名之外加 username 列已存在）
+
+**Step 1: AdminTenderNewPage 改为：先拉供应商账号列表，checkbox 多选**
+
+完整内容：
+
+```tsx
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { api } from '../api';
+import { usePolling } from '../use-polling';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+
+interface SupplierRow {
+  id: string;
+  username: string;
+  companyName: string | null;
+  active: boolean;
+}
+
+function toLocalInputValue(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+export default function AdminTenderNewPage() {
+  const navigate = useNavigate();
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [deadline, setDeadline] = useState(toLocalInputValue(new Date(Date.now() + 3 * 86400_000)));
+  const [invited, setInvited] = useState<Set<string>>(new Set());
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  // 拉供应商账号用于多选（复用 GET /admin/users）
+  const { data: usersData } = usePolling<{ users: SupplierRow[] }>(
+    useCallback(() => api('/admin/users'), []),
+  );
+  const suppliers = (usersData?.users ?? []).filter((u) => u.active);
+
+  function toggle(id: string) {
+    setInvited((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      const d = await api<{ tender: { id: string } }>('/admin/tenders', {
+        method: 'POST',
+        body: {
+          title,
+          description: description || null,
+          deadline: new Date(deadline).toISOString(),
+          invitedSupplierIds: Array.from(invited),
+        },
+      });
+      navigate(`/admin/tenders/${d.tender.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '创建失败');
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mx-auto max-w-2xl space-y-6 p-6">
+      <div>
+        <Link to="/admin" className="text-xs text-muted-foreground hover:underline">← 返回</Link>
+        <h1 className="mt-1 text-2xl font-semibold">发布招标</h1>
+      </div>
+      <Card>
+        <CardHeader>
+          <CardTitle>招标信息</CardTitle>
+          <CardDescription>默认不邀请任何供应商；下方显式勾选才能报价</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={onSubmit} className="space-y-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="title">标题</Label>
+              <Input id="title" value={title} onChange={(e) => setTitle(e.target.value)} required />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="description">招标说明（可选）</Label>
+              <Textarea id="description" rows={5} value={description} onChange={(e) => setDescription(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="deadline">报价截止时间</Label>
+              <Input id="deadline" type="datetime-local" value={deadline} onChange={(e) => setDeadline(e.target.value)} required />
+            </div>
+            <div className="space-y-1.5">
+              <Label>邀请供应商（{invited.size} / {suppliers.length}）</Label>
+              {suppliers.length === 0 ? (
+                <p className="text-xs text-muted-foreground">暂无启用的供应商账号，请先在「供应商账号」创建</p>
+              ) : (
+                <div className="space-y-1 rounded-md border border-input p-3 max-h-60 overflow-auto">
+                  {suppliers.map((s) => (
+                    <label key={s.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="rounded"
+                        checked={invited.has(s.id)}
+                        onChange={() => toggle(s.id)}
+                      />
+                      <span className="font-medium">{s.companyName ?? s.username}</span>
+                      <span className="text-xs text-muted-foreground">@{s.username}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+            {error && <p className="text-xs text-destructive">{error}</p>}
+            <Button type="submit" disabled={busy}>{busy ? '创建中…' : '创建招标'}</Button>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+```
+
+**Step 2: AdminTenderDetailPage 改造**
+
+编辑表单里加邀请多选区（在已有 deadline/description/title 之后）：
+
+```tsx
+// 顶部 usePolling 增加邀请名单加载
+const { data: usersData } = usePolling<{ users: SupplierRow[] }>(
+  useCallback(() => api('/admin/users'), []),
+);
+const allSuppliers = (usersData?.users ?? []).filter((u) => u.active);
+
+// 在 useState 增加
+const [invited, setInvited] = useState<Set<string>>(new Set());
+const [invitedInitialized, setInvitedInitialized] = useState(false);
+
+// 在 useEffect 初始化 invited（首次拿到 t 时）
+useEffect(() => {
+  if (data && !invitedInitialized) {
+    setInvited(new Set((data.tender.invitedSupplierIds as string[]) ?? []));
+    setInvitedInitialized(true);
+  }
+}, [data, invitedInitialized]);
+
+function toggleInvited(id: string) {
+  setInvited((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    return next;
+  });
+}
+
+// saveEdit() 在 body 增加 invitedSupplierIds: Array.from(invited)
+async function saveEdit() {
+  setMsg('');
+  setError('');
+  try {
+    await api(`/api/admin/tenders/${id}`, {
+      method: 'PATCH',
+      body: {
+        title,
+        description: description || null,
+        ...(deadline ? { deadline: new Date(deadline).toISOString() } : {}),
+        invitedSupplierIds: Array.from(invited),
+      },
+    });
+    setMsg('已保存');
+    setEditing(false);
+  } catch (err) {
+    setError(err instanceof ApiError ? err.message : '保存失败');
+  }
+}
+
+// 在 CardContent 里编辑表单的 deadline 后追加：
+<div className="space-y-1.5">
+  <Label>邀请供应商（{invited.size} / {allSuppliers.length}）</Label>
+  {allSuppliers.length === 0 ? (
+    <p className="text-xs text-muted-foreground">暂无启用的供应商账号</p>
+  ) : (
+    <div className="space-y-1 rounded-md border border-input p-3 max-h-60 overflow-auto">
+      {allSuppliers.map((s) => (
+        <label key={s.id} className="flex items-center gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            className="rounded"
+            checked={invited.has(s.id)}
+            onChange={() => toggleInvited(s.id)}
+          />
+          <span className="font-medium">{s.companyName ?? s.username}</span>
+          <span className="text-xs text-muted-foreground">@{s.username}</span>
+        </label>
+      ))}
+    </div>
+  )}
+</div>
+```
+
+并额外在招标详情（编辑按钮区域下）加一个"邀请名单摘要"小段，让管理员即使未点编辑也能看到邀请了谁：
+
+```tsx
+{!editing && (
+  <p className="mt-2 text-xs text-muted-foreground">
+    已邀请 {(tender as any).invitedSupplierIds?.length ?? 0} 家供应商
+  </p>
+)}
+```
+
+**Step 3: build 验证**
+
+Run: `npm run typecheck && npm run build`
+Expected: 通过
+
+**Step 4: 容器重建 + 冒烟**
+
+Run: `docker compose up -d --build`
+Expected: 容器重启
+
+Live smoke（与原 Task 19 类似，但加邀请维度）：
+```bash
+TOKEN=...  # admin token
+TID=...    # 已有招标
+# 给已有 test_sup（之前 smoke 创建的）创建第二个供应商
+curl ... /admin/users -> 新供应商 sup_excluded
+# 查看测试招标详情（应已有 invitedSupplierIds 字段）
+curl ... /admin/tenders/$TID -> 看到 invitedSupplierIds: ["08133351-..."]（backfill 后的 test_sup）
+# 给已存在的 TID 单条删除 test_sup 的邀请
+curl -X DELETE /api/admin/tenders/$TID/invitations/<test_sup.id>
+# 此时 test_sup 用 sup_token GET /api/tenders/$TID 应返回 404
+```
+
+**Step 5: Commit**
+
+```bash
+git add src/pages/AdminTenderNewPage.tsx src/pages/AdminTenderDetailPage.tsx
+git commit -m "feat: 管理员发布/编辑招标邀请多选区"
+```
