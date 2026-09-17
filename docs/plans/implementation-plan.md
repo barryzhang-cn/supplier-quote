@@ -4849,3 +4849,708 @@ curl -X DELETE /api/admin/tenders/$TID/invitations/<test_sup.id>
 git add src/pages/AdminTenderNewPage.tsx src/pages/AdminTenderDetailPage.tsx
 git commit -m "feat: 管理员发布/编辑招标邀请多选区"
 ```
+
+---
+
+# PATCH: 多管理员视图（2026-09-17 第二轮增量）
+
+新增 6 个任务（Task 25-30）。原则：不破坏已有 Task 1-24 的实现；只在前后端相关路由打补丁。
+
+## Task 25: user_role enum 扩展 + 迁移
+
+**Files:**
+- Modify: `server/db/schema.ts`（userRole enum 追加 'procurement'）
+- Modify: `server/auth/jwt.ts`（`Role` type 增加 'procurement'）
+- Create: `drizzle/0002_*.sql`（drizzle-kit generate 生成）
+
+**Step 1: 修改 schema**
+
+`server/db/schema.ts` 第 16 行 `pgEnum('user_role', ['admin', 'supplier'])` 改为：
+```ts
+export const userRole = pgEnum('user_role', ['admin', 'procurement', 'supplier']);
+```
+
+**Step 2: 扩展 Role 类型**
+
+`server/auth/jwt.ts`:
+```ts
+export type Role = 'admin' | 'procurement' | 'supplier';
+```
+
+**Step 3: 生成迁移**
+
+Run: `npm run db:generate`
+Expected: `drizzle/0002_*.sql` 生成（含 `ALTER TYPE user_role ADD VALUE 'procurement'`）
+
+注意：postgres 的 `ALTER TYPE ... ADD VALUE` 必须在事务外执行；drizzle 0.30 会生成正确语法。
+
+**Step 4: 类型检查 + 应用迁移**
+
+Run: `npm run typecheck` → 无错误
+Run: `npm run db:migrate` → 输出 "migrations applied"
+
+**Step 5: 验证 enum**
+
+```bash
+docker exec 1Panel-postgresql-NSJt psql -U supplier_quote -d supplier_quote \
+  -c "SELECT enum_range(NULL::user_role);"
+```
+Expected: `{admin,procurement,supplier}`
+
+**Step 6: Commit**
+
+```bash
+git add server/db/schema.ts server/auth/jwt.ts drizzle/
+git commit -m "feat: user_role enum 扩展 procurement 角色 + drizzle 迁移"
+```
+
+## Task 26: admin 守卫工具 + requireRole 支持多角色（TDD）
+
+**Files:**
+- Create: `server/services/admin-guard.ts`
+- Modify: `server/auth/middleware.ts`（`requireRole` 支持数组）
+- Create: `tests/admin-guard.test.ts`
+
+**Step 1: 扩展 requireRole 接受数组**
+
+`server/auth/middleware.ts`:
+```ts
+export function requireRole(role: Role | Role[]) {
+  const allowed = Array.isArray(role) ? role : [role];
+  return (req: Request, res: Response, next: NextFunction) => {
+    const user = (req as AuthedRequest).user;
+    if (!user || !allowed.includes(user.role as Role)) {
+      return res.status(403).json({ error: '无权限' });
+    }
+    next();
+  };
+}
+```
+
+注意导入 `Role` from `./jwt`。
+
+**Step 2: 写失败测试** `tests/admin-guard.test.ts`
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { testDb } from './setup';
+import { tenders } from '../server/db/schema';
+import { insertUser } from './helpers';
+import {
+  isOwnTender,
+  assertOwnTender,
+} from '../server/services/admin-guard';
+
+async function seed() {
+  await testDb.delete(tenders);
+  const admin = await insertUser(testDb, { username: 'boss', role: 'admin' });
+  const proc = await insertUser(testDb, { username: 'buyer', role: 'procurement' });
+  const t1 = await testDb
+    .insert(tenders)
+    .values({ title: 'A', deadline: new Date(Date.now() + 86400_000), createdBy: admin.user.id })
+    .returning();
+  const t2 = await testDb
+    .insert(tenders)
+    .values({ title: 'B', deadline: new Date(Date.now() + 86400_000), createdBy: proc.user.id })
+    .returning();
+  return { admin: admin.user, proc: proc.user, t1: t1[0], t2: t2[0] };
+}
+
+describe('admin guard', () => {
+  it('isOwnTender: admin 看任意', async () => {
+    const { admin, t1, t2 } = await seed();
+    expect(await isOwnTender(testDb, t1.id, admin.id, admin.role)).toBe(true);
+    expect(await isOwnTender(testDb, t2.id, admin.id, admin.role)).toBe(true);
+  });
+
+  it('isOwnTender: procurement 仅自己创建的', async () => {
+    const { proc, t1, t2 } = await seed();
+    expect(await isOwnTender(testDb, t1.id, proc.id, proc.role)).toBe(false);
+    expect(await isOwnTender(testDb, t2.id, proc.id, proc.role)).toBe(true);
+  });
+
+  it('assertOwnTender: 非所有者抛 404', async () => {
+    const { proc, t1 } = await seed();
+    await expect(assertOwnTender(testDb, t1.id, proc.id, proc.role)).rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+```
+
+**Step 3: 运行确认失败**
+
+Run: `npx vitest run tests/admin-guard.test.ts`
+Expected: FAIL — 模块不存在
+
+**Step 4: 实现** `server/services/admin-guard.ts`
+
+```ts
+import { eq } from 'drizzle-orm';
+import { tenders } from '../db/schema';
+import type { Db } from '../db/client';
+
+export async function isOwnTender(
+  db: Db,
+  tenderId: string,
+  userId: string,
+  role: 'admin' | 'procurement' | 'supplier',
+): Promise<boolean> {
+  if (role === 'admin') {
+    // admin 永远能看任何招标
+    const [row] = await db.select({ id: tenders.id }).from(tenders).where(eq(tenders.id, tenderId));
+    return !!row;
+  }
+  if (role === 'procurement') {
+    const [row] = await db
+      .select({ id: tenders.id })
+      .from(tenders)
+      .where(eq(tenders.id, tenderId));
+    return row?.id != null && (await isCreatedBy(db, tenderId, userId));
+  }
+  return false;
+}
+
+async function isCreatedBy(db: Db, tenderId: string, userId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: tenders.id })
+    .from(tenders)
+    .where(eq(tenders.id, tenderId));
+  if (!row) return false;
+  const [t] = await db
+    .select({ createdBy: tenders.createdBy })
+    .from(tenders)
+    .where(eq(tenders.id, tenderId));
+  return t?.createdBy === userId;
+}
+
+/**
+ * admin: 永远通过
+ * procurement: 仅 created_by = me
+ * supplier: 永远 404（不该用此函数）
+ */
+export async function assertOwnTender(
+  db: Db,
+  tenderId: string,
+  userId: string,
+  role: 'admin' | 'procurement' | 'supplier',
+): Promise<void> {
+  const ok = await isOwnTender(db, tenderId, userId, role);
+  if (!ok) {
+    throw Object.assign(new Error('招标不存在'), { statusCode: 404 });
+  }
+}
+```
+
+**Step 5: 运行确认通过**
+
+Run: `npx vitest run tests/admin-guard.test.ts`
+Expected: 3 passed
+
+**Step 6: Commit**
+
+```bash
+git add server/auth/middleware.ts server/services/admin-guard.ts tests/admin-guard.test.ts
+git commit -m "feat: admin 守卫（isOwnTender/assertOwnTender）+ requireRole 多角色支持"
+```
+
+## Task 27: admin 路由加 procurement 守卫（TDD）
+
+**Files:**
+- Modify: `server/routes/admin.ts`（tenders 部分全部加 created_by 守卫）
+- Modify: `server/app.ts`（admin 路由挂 requireRole(['admin','procurement'])）
+- Create: `tests/admin-procurement-scope.test.ts`
+
+**Step 1: 写失败测试** `tests/admin-procurement-scope.test.ts`
+
+```ts
+import { describe, it, expect } from 'vitest';
+import request from 'supertest';
+import { createApp } from '../server/app';
+import { testDb } from './setup';
+import { insertUser, loginToken, auth } from './helpers';
+import { tenders } from '../server/db/schema';
+
+async function setup() {
+  const app = createApp(testDb);
+  const boss = await insertUser(testDb, { username: 'boss', role: 'admin' });
+  const buyer = await insertUser(testDb, { username: 'buyer', role: 'procurement' });
+  const bossTok = await loginToken(app, 'boss', 'Passw0rd!123');
+  const buyerTok = await loginToken(app, 'buyer', 'Passw0rd!123');
+  return { app, boss: boss.user, buyer: buyer.user, bossTok, buyerTok };
+}
+
+async function createTenderAs(token: string, app: ReturnType<typeof createApp>) {
+  const res = await request(app)
+    .post('/api/admin/tenders')
+    .set(auth(token))
+    .send({
+      title: 'T',
+      deadline: new Date(Date.now() + 86400_000).toISOString(),
+      invitedSupplierIds: [],
+    });
+  return res.body.tender.id as string;
+}
+
+describe('procurement 范围隔离', () => {
+  it('admin 可看到全部招标列表', async () => {
+    const { app, bossTok, buyerTok } = await setup();
+    const tBoss = await createTenderAs(bossTok, app);
+    const tBuyer = await createTenderAs(buyerTok, app);
+    const res = await request(app).get('/api/admin/tenders').set(auth(bossTok));
+    const ids = res.body.tenders.map((t: { id: string }) => t.id);
+    expect(ids).toEqual(expect.arrayContaining([tBoss, tBuyer]));
+  });
+
+  it('procurement 列表仅自己创建的', async () => {
+    const { app, bossTok, buyerTok } = await setup();
+    const tBoss = await createTenderAs(bossTok, app);
+    const tBuyer = await createTenderAs(buyerTok, app);
+    const res = await request(app).get('/api/admin/tenders').set(auth(buyerTok));
+    const ids = res.body.tenders.map((t: { id: string }) => t.id);
+    expect(ids).toContain(tBuyer);
+    expect(ids).not.toContain(tBoss);
+  });
+
+  it('procurement 创建招标自动 created_by = me', async () => {
+    const { app, buyer, buyerTok } = await setup();
+    const tid = await createTenderAs(buyerTok, app);
+    const [t] = await testDb.select().from(tenders).where(eq(tenders.id, tid));
+    expect(t.createdBy).toBe(buyer.id);
+  });
+
+  it('procurement 详情自己创建的 200，他人 404', async () => {
+    const { app, bossTok, buyerTok } = await setup();
+    const tBoss = await createTenderAs(bossTok, app);
+    const tBuyer = await createTenderAs(buyerTok, app);
+    const own = await request(app).get(`/api/admin/tenders/${tBuyer}`).set(auth(buyerTok));
+    const other = await request(app).get(`/api/admin/tenders/${tBoss}`).set(auth(buyerTok));
+    expect(own.status).toBe(200);
+    expect(other.status).toBe(404);
+  });
+
+  it('procurement 编辑他人招标 404', async () => {
+    const { app, bossTok, buyerTok } = await setup();
+    const tBoss = await createTenderAs(bossTok, app);
+    const res = await request(app)
+      .patch(`/api/admin/tenders/${tBoss}`)
+      .set(auth(buyerTok))
+      .send({ title: '改' });
+    expect(res.status).toBe(404);
+  });
+
+  it('procurement 编辑自己招标但禁止改 created_by', async () => {
+    const { app, boss, buyerTok } = await setup();
+    const tBuyer = await createTenderAs(buyerTok, app);
+    // 试图把 created_by 改成 boss
+    const res = await request(app)
+      .patch(`/api/admin/tenders/${tBuyer}`)
+      .set(auth(buyerTok))
+      .send({ title: '新', createdBy: boss.id });
+    expect(res.status).toBe(200);
+    const detail = await request(app).get(`/api/admin/tenders/${tBuyer}`).set(auth(buyerTok));
+    // created_by 不应改变（保持 procurement 自身）
+    expect(detail.body.tender.createdBy).not.toBe(boss.id);
+  });
+
+  it('procurement 可管理供应商账号（与 admin 等同）', async () => {
+    const { app, buyerTok } = await setup();
+    const res = await request(app)
+      .post('/api/admin/users')
+      .set(auth(buyerTok))
+      .send({ username: 'new_sup', password: 'InitPass!234', companyName: '新供应商' });
+    expect(res.status).toBe(201);
+  });
+
+  it('admin 可以修改 procurement 创建的招标的 created_by（重新指派）', async () => {
+    const { app, boss, buyer, bossTok, buyerTok } = await setup();
+    const tBuyer = await createTenderAs(buyerTok, app);
+    const res = await request(app)
+      .patch(`/api/admin/tenders/${tBuyer}`)
+      .set(auth(bossTok))
+      .send({ createdBy: boss.id });
+    expect(res.status).toBe(200);
+    const detail = await request(app).get(`/api/admin/tenders/${tBuyer}`).set(auth(bossTok));
+    expect(detail.body.tender.createdBy).toBe(boss.id);
+  });
+});
+```
+
+顶部需 `import { eq } from 'drizzle-orm'`。
+
+**Step 2: 运行确认失败**
+
+Run: `npx vitest run tests/admin-procurement-scope.test.ts`
+Expected: FAIL — 当前 admin 路由全部对任意 role 开放且不验证 created_by
+
+**Step 3: 修改 app.ts**
+
+`server/app.ts`:
+```ts
+app.use('/api/admin', requireAuthMw, requireRole(['admin', 'procurement']), adminRouter(db));
+```
+
+**Step 4: 修改 server/routes/admin.ts**
+
+a) 顶部 import 增加：
+```ts
+import { assertOwnTender } from '../services/admin-guard';
+```
+
+b) `GET /admin/tenders`：当 procurement 时加 `WHERE created_by = me.id`
+
+c) `GET /admin/tenders/:id`：调用 `await assertOwnTender(db, req.params.id, currentUser(req).id, currentUser(req).role)`；非 owner 抛 404
+
+d) `POST /admin/tenders`：procurement 时强制 `createdBy = currentUser(req).id`（无需在 body 中允许指定）
+
+e) `PATCH /admin/tenders/:id`：调用 `assertOwnTender`；procurement 时**忽略 body.createdBy**（不更新）
+
+g) `POST /admin/tenders/:id/close` 与邀请增删：调用 `assertOwnTender`
+
+具体实现：
+```ts
+r.get('/tenders', async (req, res) => {
+  const me = currentUser(req);
+  const where = me.role === 'procurement' ? eq(tenders.createdBy, me.id) : undefined;
+  const rows = await db
+    .select({...})
+    .from(tenders)
+    .leftJoin(...)
+    .where(where)
+    .groupBy(tenders.id)
+    .orderBy(desc(tenders.createdAt));
+  res.json({ tenders: rows });
+});
+
+r.post('/tenders', async (req, res) => {
+  const me = currentUser(req);
+  // ...
+  const createdBy = me.role === 'procurement' ? me.id : (parsed.data.createdBy ?? me.id);
+  // 注：当前未在 body 暴露 createdBy 字段；如果未来 admin 需要 POST 时指定，再加
+});
+
+r.get('/tenders/:id', async (req, res) => {
+  await assertOwnTender(db, req.params.id, currentUser(req).id, currentUser(req).role);
+  // ...原有逻辑
+});
+
+r.patch('/tenders/:id', async (req, res) => {
+  const me = currentUser(req);
+  await assertOwnTender(db, req.params.id, me.id, me.role);
+  // ...原有逻辑
+  // 注意：procurement 若在 body 传了 createdBy，忽略；admin 可传
+  if (me.role !== 'procurement' && parsed.data.createdBy) {
+    values.createdBy = parsed.data.createdBy;
+  }
+});
+
+r.post('/tenders/:id/close', async (req, res) => {
+  await assertOwnTender(db, req.params.id, currentUser(req).id, currentUser(req).role);
+  // ...
+});
+
+r.post('/tenders/:id/invitations', async (req, res) => {
+  await assertOwnTender(db, req.params.id, currentUser(req).id, currentUser(req).role);
+  // ...
+});
+
+r.delete('/tenders/:id/invitations/:supplierId', async (req, res) => {
+  await assertOwnTender(db, req.params.id, currentUser(req).id, currentUser(req).role);
+  // ...
+});
+```
+
+`get/post/patch /admin/users` 不加守卫（两类用户都可全权）。
+
+**Step 5: 运行确认通过**
+
+Run: `npx vitest run tests/admin-procurement-scope.test.ts`
+Expected: 8 passed
+
+Run: `npm test`
+Expected: 全过（既有 66 + 新增 3 + 8 = 77+）
+
+**Step 6: Commit**
+
+```bash
+git add server/app.ts server/routes/admin.ts tests/admin-procurement-scope.test.ts
+git commit -m "feat: procurement 范围隔离（仅看自己创建的招标；不可改 created_by）"
+```
+
+## Task 28: 新建账号接口支持 role 选择（TDD）
+
+**Files:**
+- Modify: `server/routes/admin.ts`（`POST /admin/users` schema + 创建）
+- Create: `tests/admin-users-role.test.ts`
+
+**Step 1: 写失败测试** `tests/admin-users-role.test.ts`
+
+```ts
+import { describe, it, expect } from 'vitest';
+import request from 'supertest';
+import { createApp } from '../server/app';
+import { testDb } from './setup';
+import { insertUser, loginToken, auth } from './helpers';
+
+describe('POST /admin/users role 字段', () => {
+  it('默认 role=supplier', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'boss', role: 'admin' });
+    const tok = await loginToken(app, 'boss', 'Passw0rd!123');
+    const res = await request(app)
+      .post('/api/admin/users')
+      .set(auth(tok))
+      .send({ username: 's1', password: 'InitPass!234', companyName: '甲' });
+    expect(res.status).toBe(201);
+    expect(res.body.user.role).toBe('supplier');
+  });
+
+  it('显式 role=procurement 可创建', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'boss', role: 'admin' });
+    const tok = await loginToken(app, 'boss', 'Passw0rd!123');
+    const res = await request(app)
+      .post('/api/admin/users')
+      .set(auth(tok))
+      .send({
+        username: 'buyer',
+        password: 'InitPass!234',
+        companyName: '采购员',
+        role: 'procurement',
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.user.role).toBe('procurement');
+  });
+
+  it('显式 role=admin 可创建（允许超级管理员晋升他人）', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'boss', role: 'admin' });
+    const tok = await loginToken(app, 'boss', 'Passw0rd!123');
+    const res = await request(app)
+      .post('/api/admin/users')
+      .set(auth(tok))
+      .send({ username: 'boss2', password: 'InitPass!234', role: 'admin' });
+    expect(res.status).toBe(201);
+    expect(res.body.user.role).toBe('admin');
+  });
+
+  it('非法 role 返回 422', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'boss', role: 'admin' });
+    const tok = await loginToken(app, 'boss', 'Passw0rd!123');
+    const res = await request(app)
+      .post('/api/admin/users')
+      .set(auth(tok))
+      .send({ username: 'x', password: 'InitPass!234', role: 'hacker' });
+    expect(res.status).toBe(422);
+  });
+});
+```
+
+**Step 2: 运行确认失败**
+
+Run: `npx vitest run tests/admin-users-role.test.ts`
+Expected: FAIL — 当前 schema 不接受 role
+
+**Step 3: 修改 admin.ts**
+
+`createUserSchema` 增加可选 `role` 字段：
+
+```ts
+const createUserSchema = z.object({
+  username: z
+    .string()
+    .min(2)
+    .max(50)
+    .regex(/^[\w.-]+$/, '用户名仅限字母、数字、._-'),
+  password: z.string().min(8, '密码至少 8 位').max(72),
+  companyName: z.string().min(1, '公司名称必填').max(100).optional(),
+  role: z.enum(['admin', 'procurement', 'supplier']).default('supplier'),
+});
+```
+
+`POST /users` 处理：
+```ts
+const [u] = await db
+  .insert(users)
+  .values({
+    username,
+    passwordHash: hashPassword(password),
+    role: parsed.data.role,
+    companyName: parsed.data.companyName ?? null,
+  })
+  .returning({ id: users.id, username: users.username, companyName: users.companyName, role: users.role });
+```
+
+**Step 4: 运行确认通过**
+
+Run: `npx vitest run tests/admin-users-role.test.ts`
+Expected: 4 passed
+
+Run: `npm test`
+Expected: 全过
+
+**Step 5: Commit**
+
+```bash
+git add server/routes/admin.ts tests/admin-users-role.test.ts
+git commit -m "feat: 新建账号接口支持 role 字段（admin/procurement/supplier）"
+```
+
+## Task 29: 前端 AdminUsersPage + App.tsx role 数组 + 显示角色
+
+**Files:**
+- Modify: `src/pages/AdminUsersPage.tsx`
+- Modify: `src/App.tsx`
+
+**Step 1: AdminUsersPage 增加 role 字段**
+
+在表单加 role 单选：
+
+```tsx
+<div className="space-y-1.5">
+  <Label>角色</Label>
+  <select
+    value={role}
+    onChange={(e) => setRole(e.target.value as 'admin' | 'procurement' | 'supplier')}
+    className="flex h-9 w-full rounded-md border border-input bg-card px-3 py-1 text-sm"
+  >
+    <option value="supplier">供应商</option>
+    <option value="procurement">招标管理员</option>
+    <option value="admin">超级管理员</option>
+  </select>
+</div>
+```
+
+state 增加 `const [role, setRole] = useState<'admin' | 'procurement' | 'supplier'>('supplier');`
+
+提交 body 增加 `role`。
+
+账号列表显示 role 标识：在 `TableHead` 加一列「角色」，每行显示中文标签：
+- `admin` → 超级管理员（红色 badge）
+- `procurement` → 招标管理员（蓝色 badge）
+- `supplier` → 供应商（灰色 badge）
+
+**Step 2: App.tsx Protected 组件支持 role 数组**
+
+`Protected` 当前签名 `role?: 'admin' | 'supplier'`，改为：
+```tsx
+function Protected({
+  role,
+  children,
+}: {
+  role?: 'admin' | 'procurement' | 'supplier' | Array<'admin' | 'procurement' | 'supplier'>;
+  children: React.ReactNode;
+}) {
+  // ...
+  const allowed = Array.isArray(role) ? role : (role ? [role] : null);
+  if (role && allowed && !allowed.includes(user.role)) {
+    return <Navigate to={...} replace />;
+  }
+  // ...
+}
+```
+
+admin 路由用 `role={['admin', 'procurement']}`，supplier 用 `role="supplier"`。
+
+`src/auth-context.tsx` 中 `CurrentUser.role` 类型扩展为 `'admin' | 'procurement' | 'supplier'`。
+
+**Step 3: build + typecheck**
+
+Run: `npm run typecheck && npm run build`
+Expected: 通过
+
+**Step 4: Commit**
+
+```bash
+git add src/
+git commit -m "feat: 前端支持 procurement 角色（AdminUsersPage + 路由守卫）"
+```
+
+## Task 30: 容器重建 + 端到端冒烟 + 推送 GitHub
+
+**Files:** 无新文件（部署操作）
+
+**Step 1: 重建容器**
+
+```bash
+docker compose up -d --build
+```
+
+Expected: 容器重启，新镜像加载新 middleware + 新 schema 迁移代码
+
+容器自动执行：
+1. drizzle migrate 0002（`ALTER TYPE user_role ADD VALUE 'procurement'`）
+2. listen :3000
+
+**Step 2: 端到端冒烟**
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"AdminInit!234"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+# 创建 procurement 用户
+curl -s -X POST http://localhost:8090/api/admin/users \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"buyer1","password":"Buyer1!2345","role":"procurement"}'
+# 返回 role=procurement
+
+# buyer1 登录拿 token
+BTOK=$(curl -s -X POST http://localhost:8090/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"buyer1","password":"Buyer1!2345"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+
+# admin 发布一个招标
+T1=$(curl -s -X POST http://localhost:8090/api/admin/tenders \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"admin 的招标","deadline":"'$(date -u -d '+3 days' '+%Y-%m-%dT%H:%M:%S.000Z')'"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['tender']['id'])")
+echo "admin 招标: $T1"
+
+# buyer1 发布一个招标
+T2=$(curl -s -X POST http://localhost:8090/api/admin/tenders \
+  -H "Authorization: Bearer $BTOK" -H 'Content-Type: application/json' \
+  -d '{"title":"buyer1 的招标","deadline":"'$(date -u -d '+3 days' '+%Y-%m-%dT%H:%M:%S.000Z')'"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['tender']['id'])")
+echo "buyer1 招标: $T2"
+
+# admin 列表：2 个；buyer1 列表：1 个（自己的）
+echo "admin 列表：" && curl -s http://localhost:8090/api/admin/tenders -H "Authorization: Bearer $TOKEN" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  看到 {len(d[\"tenders\"])} 个')"
+echo "buyer1 列表：" && curl -s http://localhost:8090/api/admin/tenders -H "Authorization: Bearer $BTOK" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  看到 {len(d[\"tenders\"])} 个')"
+
+# buyer1 看 admin 招标 → 404
+echo "buyer1 看 admin 招标：" && curl -s -o /dev/null -w "HTTP %{http_code}\n" "http://localhost:8090/api/admin/tenders/$T1" -H "Authorization: Bearer $BTOK"
+
+# buyer1 编辑 admin 招标 → 404
+echo "buyer1 编辑 admin 招标：" && curl -s -o /dev/null -w "HTTP %{http_code}\n" -X PATCH "http://localhost:8090/api/admin/tenders/$T1" -H "Authorization: Bearer $BTOK" -H 'Content-Type: application/json' -d '{"title":"hacked"}'
+
+# buyer1 编辑自己招标但试图改 created_by → 应被忽略
+echo "buyer1 试图转让自己的招标 created_by："
+curl -s -X PATCH "http://localhost:8090/api/admin/tenders/$T2" -H "Authorization: Bearer $BTOK" -H 'Content-Type: application/json' \
+  -d "{\"title\":\"buyer1 修改后\",\"createdBy\":\"$(curl -s http://localhost:8090/api/auth/me -H "Authorization: Bearer $BTOK" | python3 -c "import json,sys; print(json.load(sys.stdin)['user']['id'])")\"}" | head -c 200
+echo
+# 然后 admin 看 T2 的 created_by 是否变了
+echo "admin 看 buyer1 的招标 created_by：" && curl -s "http://localhost:8090/api/admin/tenders/$T2" -H "Authorization: Bearer $TOKEN" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  createdBy = {d[\"tender\"][\"createdBy\"]}')"
+
+# buyer1 可管理供应商账号
+echo "buyer1 创建供应商账号：" && curl -s -X POST http://localhost:8090/api/admin/users \
+  -H "Authorization: Bearer $BTOK" -H 'Content-Type: application/json' \
+  -d '{"username":"sup_by_buyer","password":"Sup!23456","companyName":"buyer1 名下供应商"}' | head -c 100
+echo
+```
+
+Expected: 所有断言正确（隔离、转让失败、账号管理可用）
+
+**Step 3: 推送到 GitHub**
+
+```bash
+git add -A
+git commit -m "feat(procurement): 多管理员视图（procurement 角色 + 范围隔离）" --allow-empty
+git push origin main
+```
+
+**Step 4: 收尾**
+
+- 监控 `docker logs supplier-quote` 看 enum 迁移是否被正确应用（首次启动会看到 drizzle 的 NOTICE）
+- 浏览器访问 `http://172.18.9.55:8090`，用 admin 创建 procurement 账号，体验范围隔离

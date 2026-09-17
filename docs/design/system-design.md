@@ -51,8 +51,8 @@
 | id | uuid PK | |
 | username | text UNIQUE NOT NULL | 登录名 |
 | password_hash | text NOT NULL | scrypt（node:crypto，无原生依赖） |
-| role | enum('admin','supplier') | |
-| company_name | text | 供应商公司名（管理员可为空） |
+| role | enum('admin','procurement','supplier') | admin = 超级管理员（看全部）；procurement = 招标管理员（仅看自己创建的招标） |
+| company_name | text | 供应商公司名（管理员/采购员可为空） |
 | active | boolean DEFAULT true | 停用后禁止登录 |
 | created_at | timestamptz | |
 
@@ -108,6 +108,7 @@
 4. **邀请名单可变性（2026-09-17 新增）**：招标发布后任何时刻可增删（即便已有报价）。被移除的供应商立即看不到招标、不能再报价；但其**历史报价在管理员账面上保留**。创建/编辑时可批量调整（`invitedSupplierIds` 字段，幂等）；运行期可走单条邀请管理接口（见 API 表）。
 5. **邀请默认值（2026-09-17 新增）**：创建/编辑招标时，`invitedSupplierIds` 不传或传空数组 = **不邀请任何人**（刻意收紧默认）。
 6. **实时名次**：供应商名次卡片、管理员报价榜均 5 秒轮询。
+7. **管理员多视图隔离（2026-09-17 新增）**：`procurement`（招标管理员）仅能看到与操作自己创建的招标（`tenders.created_by = me`）。`admin`（超级管理员）看全部。`procurement` 可管理供应商账号（与管理员同权）但**禁止修改 `created_by`** 以防止责任转移。`admin` 可以修改任何招标的 `created_by` 以重新指派。procurement 看不到他人创建的招标时统一返回 404（与供应商邀请隔离语义一致）。
 
 ## 5. API 设计
 
@@ -120,17 +121,19 @@
 | POST | /auth/login | {username, password} → {token, user{id, role, companyName}}；停用账号返回 403 |
 | GET | /auth/me | 当前用户信息 |
 
-### 管理员（role=admin）
+### 管理员（role=admin 或 procurement）
+
+> 路由对 admin 与 procurement 都开放，但 procurement 仅能看到与操作自己创建的招标；admin 看全部。供应商账号管理两类用户都有完整权限。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET/POST | /admin/users | 列表 / 新建供应商账号（管理员设置初始密码） |
+| GET/POST | /admin/users | 列表 / 新建账号（可选 `role: 'admin' \| 'procurement' \| 'supplier'`，默认 supplier） |
 | PATCH | /admin/users/:id | 重置密码 / 停用启用 |
-| GET/POST | /admin/tenders | 招标列表（含报价数统计）/ 新建招标；POST 可选 body `invitedSupplierIds: string[]`（2026-09-17 新增） |
-| GET/PATCH | /admin/tenders/:id | 详情（含全部报价+名次+邀请名单 `invitedSupplierIds`）/ 编辑；PATCH 可选 body `invitedSupplierIds: string[]`（2026-09-17 新增） |
-| POST | /admin/tenders/:id/close | 提前关闭 |
-| POST | /admin/tenders/:id/invitations | 增补单个邀请 `{supplierId}`；用于运行期调整（2026-09-17 新增） |
-| DELETE | /admin/tenders/:id/invitations/:supplierId | 取消单个邀请；该供应商历史报价保留（2026-09-17 新增） |
+| GET/POST | /admin/tenders | 列表（含报价数统计）/ 新建招标；POST 可选 body `invitedSupplierIds: string[]`。procurement 创建时 `created_by` 自动设为 me |
+| GET/PATCH | /admin/tenders/:id | 详情（含全部报价+名次+邀请名单 `invitedSupplierIds`）/ 编辑；PATCH 可选 body `invitedSupplierIds: string[]`。procurement 仅自己创建的招标；PATCH 不能改 `created_by`（admin 可改） |
+| POST | /admin/tenders/:id/close | 提前关闭；procurement 仅自己创建的招标 |
+| POST | /admin/tenders/:id/invitations | 增补单个邀请 `{supplierId}`；procurement 仅自己创建的招标 |
+| DELETE | /admin/tenders/:id/invitations/:supplierId | 取消单个邀请；该供应商历史报价保留；procurement 仅自己创建的招标 |
 
 ### 供应商（role=supplier）
 
@@ -200,10 +203,20 @@ CREATE DATABASE supplier_quote OWNER supplier_quote;
 - 供应商自助注册（账号一律管理员创建）
 - 公网暴露与 HTTPS（接入方式确定后再加）
 
-## 10. 决策记录（增量需求：2026-09-17 邀请名单）
+## 10. 决策记录
+
+### 增量需求：2026-09-17 邀请名单
 
 | 决策 | 选项 → 选定 | 理由 |
 |---|---|---|
 | 邀请机制严格度 | 软 / 仅标记 / **硬邀请** | 用户明确要求"未邀请者看不到招标"，符合需求文档"受邀参与报价"的语义 |
 | 名单可变性 | 冻结 / **可随时调整** | 现实场景常需补充邀请遗漏的供应商；移除时报价保留避免破坏审计 |
 | 不勾默认值 | 全量默认 / **不勾则不邀请** | 用户刻意选择收紧默认，强制管理员显式选择 |
+
+### 增量需求：2026-09-17 多管理员视图
+
+| 决策 | 选项 → 选定 | 理由 |
+|---|---|---|
+| 角色模型 | 加 is_super 布尔 / **加 procurement 角色** | 显式角色比布尔标志可读性更好；与现有 enum 模式一致 |
+| 负责范围 | 多对多指派 / **仅看自己创建的** | 多对多需要额外 join 表；现实场景同一招标通常由单一采购员主导，简单方案足够 |
+| 编辑权 | 仅基本字段 / **可改但不能换主** | procurement 可维护自己创建的招标细节（含邀请名单），但 `created_by` 转给别人会制造责任真空 |
