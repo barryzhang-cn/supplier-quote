@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    container_name: supplier-quote
+    restart: unless-stopped
+    ports:
+      - "8090:3000"
+    environment:
+      # 通过 1panel-network 直连 postgres 容器（别名 postgresql），不经过宿主机防火墙
+      DATABASE_URL: postgres://supplier_quote:${DB_PASSWORD}@postgresql:5432/supplier_quote
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      TZ: Asia/Shanghai
+    networks: [1panel-network]
+
+networks:
+  1panel-network:
+    external: true
