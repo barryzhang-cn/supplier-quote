@@ -96,5 +96,18 @@ export function supplierRouter(db: Db) {
     return res.json({ created: result.created });
   });
 
+  r.get('/tenders/:id/ranking', async (req, res) => {
+    const me = currentUser(req);
+    const [t] = await db.select({ id: tenders.id }).from(tenders).where(eq(tenders.id, req.params.id));
+    if (!t) return res.status(404).json({ error: '招标不存在' });
+    const peers = await db
+      .select({ supplierId: quotes.supplierId, amount: quotes.amount, createdAt: quotes.createdAt })
+      .from(quotes)
+      .where(eq(quotes.tenderId, t.id));
+    const ranks = computeRanks(peers);
+    const myRank = ranks.get(me.id) ?? null;
+    return res.json({ rank: myRank, total: peers.length });
+  });
+
   return r;
 }
