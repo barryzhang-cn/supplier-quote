@@ -21,3 +21,4 @@ npm-debug.log*
 
 # Docker
 .dockerignore
+# Public assets are generated; favicon.ico etc are committed as source
