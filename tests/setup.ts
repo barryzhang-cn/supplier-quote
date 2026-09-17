@@ -21,7 +21,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await rawClient`TRUNCATE quotes, tenders, users CASCADE`;
+  await rawClient`TRUNCATE tender_invitations, quotes, tenders, users CASCADE`;
 });
 
 afterAll(async () => {

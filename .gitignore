@@ -1,8 +1,23 @@
+# Build artifacts
 node_modules/
 dist/
-.env
-*.log
-*.local
-.env.*.local
 *.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.*.local
+*.local
+
+# OS / Editor
 .DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# Docker
+.dockerignore
