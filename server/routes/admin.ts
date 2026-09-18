@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { and, desc, eq, sql, aliasedTable } from 'drizzle-orm';
+import { and, desc, eq, sql, aliasedTable, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 import { users, tenders, quotes } from '../db/schema';
 import { hashPassword } from '../auth/password';
@@ -189,6 +189,12 @@ export function adminRouter(db: Db) {
   // -------- 招标管理 --------
   r.get('/tenders', async (req, res) => {
     const user = me(req);
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+
+    // 自连接查创建者 username
+    const creator = aliasedTable(users, 'creator');
+
     const baseSelect = db
       .select({
         id: tenders.id,
@@ -197,17 +203,43 @@ export function adminRouter(db: Db) {
         deadline: tenders.deadline,
         status: tenders.status,
         createdBy: tenders.createdBy,
+        createdByUsername: creator.username,
         createdAt: tenders.createdAt,
         quoteCount: sql<number>`count(${quotes.id})::int`,
       })
       .from(tenders)
+      .leftJoin(creator, eq(creator.id, tenders.createdBy))
       .leftJoin(quotes, eq(quotes.tenderId, tenders.id))
-      .groupBy(tenders.id)
+      .groupBy(tenders.id, creator.username)
       .orderBy(desc(tenders.createdAt));
-    const rows =
-      user.role === 'procurement'
-        ? await baseSelect.where(eq(tenders.createdBy, user.id))
-        : await baseSelect;
+
+    // 通用过滤条件：搜索 + 状态
+    const filters: (SQL | undefined)[] = [];
+    if (q) {
+      const like = `%${q.toLowerCase()}%`;
+      filters.push(
+        sql`(lower(${tenders.title}) LIKE ${like} OR lower(coalesce(${creator.username}, '')) LIKE ${like})`,
+      );
+    }
+    if (status === 'open') {
+      filters.push(
+        sql`${tenders.status} = 'open' AND ${tenders.deadline} > now()`,
+      );
+    } else if (status === 'closed') {
+      filters.push(sql`${tenders.status} = 'closed'`);
+    } else if (status === 'expired') {
+      filters.push(
+        sql`${tenders.status} = 'open' AND ${tenders.deadline} <= now()`,
+      );
+    }
+    // status === '' 或 'all' → 不过滤
+
+    const applyScope = user.role === 'procurement'
+      ? eq(tenders.createdBy, user.id)
+      : undefined;
+
+    const where = and(applyScope, ...filters);
+    const rows = where ? await baseSelect.where(where) : await baseSelect;
     res.json({ tenders: rows });
   });
 

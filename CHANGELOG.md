@@ -6,6 +6,18 @@
 
 ### 待定
 
+## [0.6.0] - 2026-09-17
+
+### 新增
+
+- 招标管理搜索：`GET /admin/tenders?q=<keyword>`，模糊匹配标题或创建者 username
+- 招标状态筛选：`?status=open|expired|closed`；默认全部；新增「报价中」快捷筛选
+- 创建者列：`GET /admin/tenders` 返回 `createdByUsername`；前端表格新增「创建者」列
+
+### 变更
+
+- 前端 AdminTendersPage 用防抖搜索 + 下拉状态选择；保留 5s 轮询自动刷新
+
 ## [0.5.1] - 2026-09-17
 
 ### 变更
