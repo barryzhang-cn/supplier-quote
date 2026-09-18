@@ -24,7 +24,8 @@ export function canCreateRole(actorRole: Role, targetRole: Role): boolean {
 }
 
 /**
- * procurement 可以修改 supplier 账号（且必须是自己创建的）。
+ * procurement 可以修改 supplier 账号（且必须是自己创建的）；
+ * 也可以修改自己创建的 procurement（同级之间明确责任归属）。
  * admin 可以修改任何非系统管理员账号。
  */
 export function canModifyUser(
@@ -38,7 +39,9 @@ export function canModifyUser(
     return true;
   }
   if (actorRole === 'procurement') {
-    return targetRole === 'supplier' && targetCreatedBy === actorId;
+    if (targetRole === 'supplier') return targetCreatedBy === actorId;
+    if (targetRole === 'procurement') return targetCreatedBy === actorId;
+    return false;
   }
   return false;
 }
@@ -60,7 +63,7 @@ export function canChangeRole(
 /**
  * 删除权限：
  * - admin：任何非系统管理员账号（系统管理员守卫在路由层）
- * - procurement：仅自己创建的 supplier
+ * - procurement：仅自己创建的 supplier / procurement
  * - supplier：不能删任何账号
  */
 export function canDeleteUser(
@@ -71,7 +74,9 @@ export function canDeleteUser(
 ): boolean {
   if (actorRole === 'admin') return true;
   if (actorRole === 'procurement') {
-    return targetRole === 'supplier' && targetCreatedBy === actorId;
+    if (targetRole === 'supplier') return targetCreatedBy === actorId;
+    if (targetRole === 'procurement') return targetCreatedBy === actorId;
+    return false;
   }
   return false;
 }

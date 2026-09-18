@@ -144,7 +144,13 @@ export default function AdminUsersPage() {
   // 当前用户对该行的可操作权限
   function canManage(u: UserRow): boolean {
     if (isAdmin) return u.id !== me?.id;
-    if (isProcurement) return u.role === 'supplier' && u.createdBy === me?.id;
+    if (isProcurement) {
+      // 仅对自己创建的 supplier / procurement 有完整管理权
+      return (
+        (u.role === 'supplier' || u.role === 'procurement') &&
+        u.createdBy === me?.id
+      );
+    }
     return false;
   }
   // 删除权限（仅自己有完整管理权时允许）

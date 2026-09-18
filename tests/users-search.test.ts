@@ -96,7 +96,7 @@ describe('DELETE /admin/users/:id procurement 删自己创建的 supplier', () =
     expect(res.status).toBe(403);
   });
 
-  it('procurement 不能删除其它 procurement（即便自己创建的也保留权限隔离）', async () => {
+  it('procurement 可删除自己创建的 procurement（204）', async () => {
     const app = createApp(testDb);
     await insertUser(testDb, { username: 'admin', role: 'admin' });
     const buyer = await insertUser(testDb, { username: 'buyer', role: 'procurement' });
@@ -107,6 +107,78 @@ describe('DELETE /admin/users/:id procurement 删自己创建的 supplier', () =
       createdBy: buyer.user.id,
     });
     const tok = await loginToken(app, 'buyer', 'Passw0rd!123');
+    const res = await request(app).delete(`/api/admin/users/${target.user.id}`).set(auth(tok));
+    expect(res.status).toBe(204);
+  });
+
+  it('procurement 可重置自己创建的 procurement 密码', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'admin', role: 'admin' });
+    const buyer = await insertUser(testDb, { username: 'buyer', role: 'procurement' });
+    const target = await insertUser(testDb, {
+      username: 'buyer2',
+      role: 'procurement',
+      companyName: 'T',
+      createdBy: buyer.user.id,
+    });
+    const tok = await loginToken(app, 'buyer', 'Passw0rd!123');
+    const res = await request(app)
+      .patch(`/api/admin/users/${target.user.id}`)
+      .set(auth(tok))
+      .send({ password: 'NewPass!23456' });
+    expect(res.status).toBe(200);
+  });
+
+  it('procurement 可停用自己创建的 procurement', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'admin', role: 'admin' });
+    const buyer = await insertUser(testDb, { username: 'buyer', role: 'procurement' });
+    const target = await insertUser(testDb, {
+      username: 'buyer2',
+      role: 'procurement',
+      companyName: 'T',
+      createdBy: buyer.user.id,
+    });
+    const tok = await loginToken(app, 'buyer', 'Passw0rd!123');
+    const res = await request(app)
+      .patch(`/api/admin/users/${target.user.id}`)
+      .set(auth(tok))
+      .send({ active: false });
+    expect(res.status).toBe(200);
+    expect(res.body.user.active).toBe(false);
+  });
+
+  it('procurement 不能重置他人创建的 procurement 密码（403）', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'admin', role: 'admin' });
+    const buyer1 = await insertUser(testDb, { username: 'buyer1', role: 'procurement' });
+    const buyer2 = await insertUser(testDb, { username: 'buyer2', role: 'procurement' });
+    const target = await insertUser(testDb, {
+      username: 'buyer3',
+      role: 'procurement',
+      companyName: 'T',
+      createdBy: buyer2.user.id,
+    });
+    const tok = await loginToken(app, 'buyer1', 'Passw0rd!123');
+    const res = await request(app)
+      .patch(`/api/admin/users/${target.user.id}`)
+      .set(auth(tok))
+      .send({ password: 'Hacked!23456' });
+    expect(res.status).toBe(403);
+  });
+
+  it('procurement 不能删除他人创建的 procurement（403）', async () => {
+    const app = createApp(testDb);
+    await insertUser(testDb, { username: 'admin', role: 'admin' });
+    const buyer1 = await insertUser(testDb, { username: 'buyer1', role: 'procurement' });
+    const buyer2 = await insertUser(testDb, { username: 'buyer2', role: 'procurement' });
+    const target = await insertUser(testDb, {
+      username: 'buyer3',
+      role: 'procurement',
+      companyName: 'T',
+      createdBy: buyer2.user.id,
+    });
+    const tok = await loginToken(app, 'buyer1', 'Passw0rd!123');
     const res = await request(app).delete(`/api/admin/users/${target.user.id}`).set(auth(tok));
     expect(res.status).toBe(403);
   });
